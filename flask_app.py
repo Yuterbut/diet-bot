@@ -460,3 +460,30 @@ def delete_webhook():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
+@app.route('/github-webhook', methods=['POST'])
+def github_webhook():
+    import hmac
+    import hashlib
+    import subprocess
+    import os
+
+    secret = os.environ.get('GITHUB_SECRET', '').encode('utf-8')
+    signature = request.headers.get('X-Hub-Signature-256', '')
+
+    if secret:
+        payload = request.get_data()
+        expected = 'sha256=' + hmac.new(secret, payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return 'Unauthorized', 401
+
+    try:
+        result = subprocess.run(
+            ['git', '-C', '/home/f6iznj3iP7/dietbot', 'pull', 'origin', 'main'],
+            capture_output=True, text=True, timeout=30
+        )
+        print(f"Git pull: {result.stdout}")
+    except Exception as e:
+        print(f"Git pull error: {e}")
+
+    return 'OK', 200
