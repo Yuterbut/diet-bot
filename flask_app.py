@@ -112,6 +112,7 @@ def plan_keyboard(day: int = 0, total_days: int = 7):
         [{"text": "🛒 Список покупок", "callback_data": "SHOP"}],
         [{"text": "🔄 Другой вариант", "callback_data": "REGEN"},
          {"text": "⚙️ Заново", "callback_data": "START"}],
+        [{"text": "🤖 ИИ-диетолог", "callback_data": "AI|START"}],
     ]}
 
 
@@ -178,14 +179,18 @@ def measurements_prompt_keyboard():
     ]}
 
 
-def ai_menu_keyboard():
-    return {"inline_keyboard": [
+def ai_menu_keyboard(user: dict | None = None):
+    rows = [
         [{"text": "📝 Записать приём пищи", "callback_data": "AI|LOG"}],
         [{"text": "📊 Сегодня", "callback_data": "AI|TODAY"}, {"text": "📈 Неделя", "callback_data": "AI|WEEK"}],
         [{"text": "⏰ Напоминания", "callback_data": "AI|REMIND"}],
         [{"text": "💬 Спросить диетолога", "callback_data": "AI|ASK"}],
         [{"text": "👤 Анкета", "callback_data": "AI|PROFILE"}],
-    ]}
+    ]
+    if user and user.get("plan_names"):
+        rows.append([{"text": "📋 План питания", "callback_data": "PLAN"}])
+    rows.append([{"text": "🏠 Главное меню", "callback_data": "HOME"}])
+    return {"inline_keyboard": rows}
 
 
 def reminder_response_keyboard(slot: str):
@@ -205,7 +210,10 @@ def food_confirm_keyboard():
 
 
 def back_to_ai_menu_keyboard():
-    return {"inline_keyboard": [[{"text": "⬅️ В меню диетолога", "callback_data": "AI|MENU"}]]}
+    return {"inline_keyboard": [
+        [{"text": "⬅️ В меню диетолога", "callback_data": "AI|MENU"}],
+        [{"text": "🏠 Главное меню", "callback_data": "HOME"}],
+    ]}
 
 
 # ---------- Формирование сообщений ----------
@@ -357,7 +365,7 @@ def ai_advance(chat_id: int, message_id: int | None = None) -> None:
             storage.save_user(chat_id, {"goal": "maintain"})
             user = storage.get_user(chat_id)
         text = "✅ Анкета готова!\n\n" + ai_profile_text(user)
-        send(text, ai_menu_keyboard())
+        send(text, ai_menu_keyboard(user))
 
 
 def diary_day_totals(diary: list, date_str: str) -> tuple[dict, list]:
@@ -467,9 +475,9 @@ def handle_ai_question(chat_id: int, user: dict, text: str) -> None:
     storage.save_user(chat_id, {"ai_state": None})
     if not reply:
         tg("sendMessage", chat_id=chat_id, text="ИИ сейчас недоступен, попробуй чуть позже 🙏",
-           reply_markup=ai_menu_keyboard())
+           reply_markup=ai_menu_keyboard(user))
         return
-    tg("sendMessage", chat_id=chat_id, text=reply, reply_markup=ai_menu_keyboard())
+    tg("sendMessage", chat_id=chat_id, text=reply, reply_markup=ai_menu_keyboard(user))
 
 
 def handle_reminder_times(chat_id: int, text: str) -> None:
@@ -566,7 +574,7 @@ def handle_reminder_response(chat_id: int, message_id: int, sub_action: str, slo
         })
         tg("editMessageText", chat_id=chat_id, message_id=message_id,
            text=f"Записал: {label} пропущен. Бывает — наверстаем в следующий раз 🙂",
-           reply_markup=ai_menu_keyboard())
+           reply_markup=ai_menu_keyboard(user))
 
     elif sub_action == "OK":
         plan_meal = None
@@ -583,7 +591,7 @@ def handle_reminder_response(chat_id: int, message_id: int, sub_action: str, slo
         storage.add_diary_entry(chat_id, {"date": today, "time": now_t, "source": "planned", "slot": slot, **entry})
         tg("sendMessage", chat_id=chat_id,
            text=f"✅ Записал: *{entry['name']}* — {entry['kcal']} ккал", parse_mode="Markdown",
-           reply_markup=ai_menu_keyboard())
+           reply_markup=ai_menu_keyboard(user))
 
     elif sub_action == "OTHER":
         storage.save_user(chat_id, {"ai_state": "food_log"})
@@ -665,6 +673,15 @@ def handle_message(msg: dict) -> None:
         ai_advance(chat_id)
         return
 
+    if low.startswith(("/menu", "/меню")):
+        user = storage.save_user(chat_id, {"ai_state": None})
+        if user.get("plan_names"):
+            tg("sendMessage", chat_id=chat_id, text=plan_text(user, 0),
+               parse_mode="Markdown", reply_markup=plan_keyboard(0))
+        else:
+            tg("sendMessage", chat_id=chat_id, text=WELCOME, reply_markup=goal_keyboard())
+        return
+
     user = storage.get_user(chat_id)
 
     # диалог с ИИ-диетологом (анкета / запись еды / вопрос / напоминания)
@@ -693,7 +710,8 @@ def handle_message(msg: dict) -> None:
 
     tg("sendMessage", chat_id=chat_id,
        text="Я работаю кнопками 🙂\n\n"
-            "/start — составить план питания\n"
+            "/start — составить план питания заново\n"
+            "/menu — вернуться в меню (план или начало)\n"
             "/ai — ИИ-диетолог (анкета, дневник КБЖУ, напоминания)\n"
             "/продукты — список продуктов и цен\n"
             "/цена — обновить цену продукта")
@@ -836,7 +854,7 @@ def handle_callback(cb: dict) -> None:
             ai_advance(chat_id, message_id)
         elif sub == "MENU":
             storage.save_user(chat_id, {"ai_state": None})
-            edit("🤖 *ИИ-диетолог*\n\nЧто делаем?", ai_menu_keyboard())
+            edit("🤖 *ИИ-диетолог*\n\nЧто делаем?", ai_menu_keyboard(user))
         elif sub == "LOG":
             storage.save_user(chat_id, {"ai_state": "food_log"})
             edit("Напиши, что съел — например: «сникерс» или «тарелка борща с хлебом».\n"
@@ -879,16 +897,23 @@ def handle_callback(cb: dict) -> None:
             storage.add_diary_entry(chat_id, {"date": today, "time": now_t, "source": "logged", **pending})
             storage.save_user(chat_id, {"pending_food": None, "ai_state": None})
             edit(f"✅ Записал: *{pending['name']}* — {pending['kcal']} ккал "
-                 f"(Б {pending['protein']} Ж {pending['fat']} У {pending['carbs']})", ai_menu_keyboard())
+                 f"(Б {pending['protein']} Ж {pending['fat']} У {pending['carbs']})", ai_menu_keyboard(user))
         elif sub == "RETRY":
             storage.save_user(chat_id, {"pending_food": None, "ai_state": "food_log"})
             edit("Хорошо, напиши ещё раз, что съел 🍽", back_to_ai_menu_keyboard())
         else:
             storage.save_user(chat_id, {"pending_food": None, "ai_state": None})
-            edit("Отменил.", ai_menu_keyboard())
+            edit("Отменил.", ai_menu_keyboard(user))
 
     elif action == "AIR":
         handle_reminder_response(chat_id, message_id, parts[1], parts[2])
+
+    elif action == "HOME":
+        storage.save_user(chat_id, {"ai_state": None})
+        if user.get("plan_names"):
+            edit(plan_text(user, 0), plan_keyboard(0))
+        else:
+            edit(WELCOME, goal_keyboard())
 
     tg("answerCallbackQuery", callback_query_id=cb["id"])
 
