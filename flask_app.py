@@ -21,13 +21,28 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 import ai_agent
+import charts
+import food_lookup
 import nutrition
+import photos
 import planner
 import storage
 from meals_data import BUDGET_PRESETS, GOAL_LABELS, MEAL_TYPE_LABELS, RESTRICTION_LABELS
 from products import PRODUCTS, REGIONS
 
 load_dotenv(Path(__file__).parent / ".env")
+
+# Sentry — мониторинг ошибок, полностью опционален: без SENTRY_DSN просто не включается.
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.flask import FlaskIntegration
+
+        sentry_sdk.init(dsn=SENTRY_DSN, integrations=[FlaskIntegration()],
+                         traces_sample_rate=0.0, send_default_pii=False)
+    except ImportError:
+        pass
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -56,6 +71,15 @@ def tg(method: str, **payload):
     except requests.RequestException as e:
         app.logger.error("Ошибка запроса к Telegram: %s", e)
         return {}
+
+
+def tg_photo(chat_id: int, photo_bytes: bytes, caption: str = "") -> None:
+    """Отправляет сгенерированную картинку (для sendPhoto по URL используем обычный tg())."""
+    try:
+        requests.post(f"{API_URL}/sendPhoto", data={"chat_id": chat_id, "caption": caption},
+                      files={"photo": ("chart.png", photo_bytes, "image/png")}, timeout=20)
+    except requests.RequestException as e:
+        app.logger.error("Ошибка отправки фото в Telegram: %s", e)
 
 
 # ---------- Клавиатуры ----------
@@ -401,6 +425,14 @@ def ai_today_text(user: dict) -> str:
     return "\n".join(lines)
 
 
+def week_kcal_series(user: dict) -> list[tuple[str, int]]:
+    """(дата, ккал) за последние 7 дней по порядку — включая дни без записей (0 ккал), для графика."""
+    diary = user.get("diary", [])
+    today = datetime.now(TZ).date()
+    days = [(today - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
+    return [(d, diary_day_totals(diary, d)[0]["kcal"]) for d in days]
+
+
 def ai_week_text(user: dict) -> str:
     diary = user.get("diary", [])
     today = datetime.now(TZ).date()
@@ -435,6 +467,21 @@ def ai_week_text(user: dict) -> str:
     return header
 
 
+def send_week_chart(chat_id: int, user: dict) -> None:
+    series = week_kcal_series(user)
+    if not any(kcal > 0 for _, kcal in series):
+        return
+    target_kcal = None
+    profile = user.get("profile", {})
+    if nutrition.profile_complete(profile):
+        target_kcal = nutrition.full_profile_targets(profile, user.get("goal", "maintain"))["kcal"]
+    try:
+        png_bytes = charts.week_kcal_chart(series, target_kcal)
+        tg_photo(chat_id, png_bytes)
+    except Exception as e:
+        app.logger.error("Ошибка построения графика недели: %s", e)
+
+
 def ai_remind_text(user: dict) -> str:
     reminders = user.get("reminders") or DEFAULT_REMINDERS
     enabled = user.get("reminders_enabled", False)
@@ -449,9 +496,49 @@ def ai_remind_text(user: dict) -> str:
     return "\n".join(lines)
 
 
+def tg_download_file(file_id: str) -> bytes | None:
+    try:
+        info = tg("getFile", file_id=file_id)
+        file_path = (info or {}).get("result", {}).get("file_path")
+        if not file_path:
+            return None
+        resp = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{file_path}", timeout=20)
+        resp.raise_for_status()
+        return resp.content
+    except requests.RequestException as e:
+        app.logger.error("Ошибка скачивания файла из Telegram: %s", e)
+        return None
+
+
+def handle_food_photo(chat_id: int, photo_sizes: list) -> None:
+    tg("sendChatAction", chat_id=chat_id, action="typing")
+    largest = max(photo_sizes, key=lambda p: p.get("file_size") or p.get("width", 0))
+    image_bytes = tg_download_file(largest["file_id"])
+    if not image_bytes:
+        tg("sendMessage", chat_id=chat_id, text="Не получилось скачать фото, попробуй ещё раз 🙏")
+        return
+
+    estimate = ai_agent.estimate_food_from_image(image_bytes)
+    if not estimate or estimate.get("kcal", 0) == 0:
+        note = (estimate or {}).get("note") or ("не получилось распознать еду на фото — попробуй "
+                                                  "при хорошем освещении, или опиши текстом")
+        tg("sendMessage", chat_id=chat_id, text=f"🤔 {note}", reply_markup=back_to_ai_menu_keyboard())
+        return
+
+    storage.save_user(chat_id, {"pending_food": estimate, "ai_state": None})
+    lines = [f"🍽 *{estimate['name']}*"]
+    if estimate.get("portion"):
+        lines.append(f"Порция: {estimate['portion']}")
+    lines.append(f"*{estimate['kcal']} ккал* · Б {estimate['protein']} Ж {estimate['fat']} У {estimate['carbs']}")
+    if estimate.get("note"):
+        lines.append(f"_{estimate['note']}_")
+    tg("sendMessage", chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown",
+       reply_markup=food_confirm_keyboard())
+
+
 def handle_food_log(chat_id: int, text: str) -> None:
     tg("sendChatAction", chat_id=chat_id, action="typing")
-    estimate = ai_agent.estimate_food(text)
+    estimate = food_lookup.estimate(text)
     if not estimate:
         tg("sendMessage", chat_id=chat_id,
            text="Не получилось оценить калорийность — ИИ сейчас недоступен. Попробуй ещё раз чуть позже 🙏",
@@ -586,7 +673,7 @@ def handle_reminder_response(chat_id: int, message_id: int, sub_action: str, slo
                 plan_meal = plan_names[weekday][order.index(slot)]
         tg("editMessageText", chat_id=chat_id, message_id=message_id,
            text="Отлично! Оцениваю калорийность блюда… 🍽")
-        estimate = ai_agent.estimate_food(plan_meal) if plan_meal else None
+        estimate = food_lookup.estimate(plan_meal) if plan_meal else None
         entry = estimate or {"name": plan_meal or label, "portion": "", "kcal": 0, "protein": 0, "fat": 0, "carbs": 0, "note": ""}
         storage.add_diary_entry(chat_id, {"date": today, "time": now_t, "source": "planned", "slot": slot, **entry})
         tg("sendMessage", chat_id=chat_id,
@@ -680,6 +767,10 @@ def handle_message(msg: dict) -> None:
                parse_mode="Markdown", reply_markup=plan_keyboard(0))
         else:
             tg("sendMessage", chat_id=chat_id, text=WELCOME, reply_markup=goal_keyboard())
+        return
+
+    if msg.get("photo"):
+        handle_food_photo(chat_id, msg["photo"])
         return
 
     user = storage.get_user(chat_id)
@@ -836,6 +927,9 @@ def handle_callback(cb: dict) -> None:
         idx = int(parts[1])
         if idx < len(names):
             edit(planner.format_recipe(names[idx]), recipe_back_keyboard())
+            photo_url = photos.search_dish_photo(names[idx])
+            if photo_url:
+                tg("sendPhoto", chat_id=chat_id, photo=photo_url, caption=names[idx])
 
     elif action == "SHOP":
         if user.get("items"):
@@ -863,6 +957,7 @@ def handle_callback(cb: dict) -> None:
             edit(ai_today_text(user), back_to_ai_menu_keyboard())
         elif sub == "WEEK":
             edit(ai_week_text(user), back_to_ai_menu_keyboard())
+            send_week_chart(chat_id, user)
         elif sub == "REMIND":
             storage.save_user(chat_id, {"ai_state": "reminder_times"})
             edit(ai_remind_text(user), back_to_ai_menu_keyboard())

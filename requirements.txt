@@ -2,3 +2,5 @@ Flask
 requests
 python-dotenv
 tzdata
+matplotlib
+sentry-sdk[flask]

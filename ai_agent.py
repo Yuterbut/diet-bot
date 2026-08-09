@@ -10,6 +10,7 @@ GitHub PAT (GITHUB_MODELS_TOKEN), лимиты по запросам в мину
 None / понятную заглушку, чтобы бот не падал, если ИИ недоступен.
 """
 
+import base64
 import json
 import logging
 import os
@@ -116,16 +117,9 @@ FOOD_ESTIMATE_SYSTEM = """Ты — нутрициолог-эксперт. Пол
 Числа — целые, в разумных пределах (kcal 0-3000 на одну запись). Если совсем не можешь понять, что за еда — верни name как есть и note "не удалось точно оценить, значения приблизительные"."""
 
 
-def estimate_food(description: str) -> dict | None:
-    """Оценивает КБЖУ по свободному описанию еды. Возвращает dict или None при сбое ИИ."""
-    messages = [
-        {"role": "system", "content": FOOD_ESTIMATE_SYSTEM},
-        {"role": "user", "content": description.strip()},
-    ]
-    text = chat(messages, temperature=0.2, max_tokens=300)
-    if text is None:
-        return None
-
+def _parse_food_json(text: str, fallback_name: str) -> dict | None:
+    """Общий разбор ответа ИИ вида {"name":..,"kcal":..,...} — используется и для
+    текстовой, и для фото-оценки еды."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         logger.warning("Не удалось найти JSON в ответе ИИ: %s", text[:200])
@@ -137,8 +131,8 @@ def estimate_food(description: str) -> dict | None:
         return None
 
     try:
-        result = {
-            "name": str(data.get("name") or description.strip())[:120],
+        return {
+            "name": str(data.get("name") or fallback_name)[:120],
             "portion": str(data.get("portion") or "")[:60],
             "kcal": max(0, min(3000, round(float(data.get("kcal", 0))))),
             "protein": max(0, min(300, round(float(data.get("protein", 0))))),
@@ -148,7 +142,67 @@ def estimate_food(description: str) -> dict | None:
         }
     except (TypeError, ValueError):
         return None
-    return result
+
+
+def estimate_food(description: str) -> dict | None:
+    """Оценивает КБЖУ по свободному описанию еды. Возвращает dict или None при сбое ИИ."""
+    messages = [
+        {"role": "system", "content": FOOD_ESTIMATE_SYSTEM},
+        {"role": "user", "content": description.strip()},
+    ]
+    text = chat(messages, temperature=0.2, max_tokens=300)
+    if text is None:
+        return None
+    return _parse_food_json(text, fallback_name=description.strip())
+
+
+# ---------- Оценка КБЖУ по фото еды (Groq vision, фоллбек OpenAI) ----------
+
+FOOD_IMAGE_PROMPT = """Посмотри на фото еды и оцени её КБЖУ (калории, белки, жиры, углеводы).
+Определи блюдо/продукты на фото и прикинь размер порции по виду тарелки/упаковки.
+
+Отвечай СТРОГО валидным JSON без markdown, вот такой формы:
+{"name": "короткое название на русском", "portion": "например, 250 г", "kcal": 450, "protein": 20, "fat": 15, "carbs": 55, "note": "короткий комментарий, если оценка грубая"}
+Числа целые, kcal в пределах 0-3000. Если на фото не еда или не видно — верни kcal: 0 и в note напиши "не удалось распознать еду на фото"."""
+
+
+def _groq_vision_chat(content: list, temperature: float, max_tokens: int) -> str | None:
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    model = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": [{"role": "user", "content": content}],
+               "temperature": temperature, "max_tokens": max_tokens}
+    return _extract_text(_post(GROQ_URL, headers, payload))
+
+
+def _openai_vision_chat(content: list, temperature: float, max_tokens: int) -> str | None:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return None
+    model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": [{"role": "user", "content": content}],
+               "temperature": temperature, "max_tokens": max_tokens}
+    return _extract_text(_post(OPENAI_URL, headers, payload))
+
+
+def estimate_food_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict | None:
+    """Оценивает КБЖУ по фото еды. Возвращает dict или None, если vision-модели недоступны."""
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    content = [
+        {"type": "text", "text": FOOD_IMAGE_PROMPT},
+        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+    ]
+
+    text = _groq_vision_chat(content, temperature=0.2, max_tokens=300)
+    if text is None:
+        text = _openai_vision_chat(content, temperature=0.2, max_tokens=300)
+    if text is None:
+        logger.error("Vision AI недоступен: ни Groq, ни OpenAI не ответили")
+        return None
+    return _parse_food_json(text, fallback_name="Фото еды")
 
 
 # ---------- Свободное общение с диетологом ----------
