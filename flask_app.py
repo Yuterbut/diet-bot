@@ -63,6 +63,15 @@ CRON_SECRET = os.getenv("CRON_SECRET", "")
 SEX_LABELS = {"m": "Мужской", "f": "Женский"}
 MEAL_SLOT_LABELS = {"breakfast": "🌅 Завтрак", "lunch": "🥗 Обед", "dinner": "🍽 Ужин", "snack": "🍎 Перекус"}
 DEFAULT_REMINDERS = {"breakfast": "08:30", "lunch": "13:30", "dinner": "19:30"}
+
+# Опрос "поел ли ты?": спрашиваем один раз, если нет ответа — ровно один повтор
+# через час, и всё (Telegram не даёт боту статус "прочитано", поэтому ждём по
+# времени с момента отправки, а не с момента прочтения).
+FOLLOWUP_WINDOW_MINUTES = 60
+EVENING_CHECK_SLOT = "evening_check"
+EVENING_CHECK_TIME = "20:30"
+
+WEEK_DAYS = 7  # через сколько дней предлагать обновить меню
 PROFILE_SEQUENCE = ["sex", "age", "height", "weight", "activity"]
 
 
@@ -240,6 +249,21 @@ def reminder_response_keyboard(slot: str):
     ]}
 
 
+def evening_check_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "✅ Всё записано", "callback_data": "EVE|OK"}],
+        [{"text": "🍽 Было что-то ещё", "callback_data": "EVE|OTHER"}],
+    ]}
+
+
+def weekly_renewal_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "😊 Нравится, оставляем", "callback_data": "WK|KEEP"}],
+        [{"text": "🔄 Новое меню целиком", "callback_data": "WK|REGEN"}],
+        [{"text": "🍽 Заменить блюдо", "callback_data": "WK|SWAP"}],
+    ]}
+
+
 def food_confirm_keyboard():
     return {"inline_keyboard": [
         [{"text": "✅ Добавить в дневник", "callback_data": "AIL|ADD"}],
@@ -307,6 +331,8 @@ def build_and_save(chat_id: int, user: dict) -> dict:
         "over_budget": result.get("over_budget", False),
         "bought": [],
         "awaiting_budget": False,
+        "plan_created": datetime.now(TZ).date().isoformat(),
+        "plan_renewal_notified": False,
     })
 
 
@@ -505,9 +531,13 @@ def ai_remind_text(user: dict) -> str:
     lines.append(f"Завтрак: {reminders.get('breakfast', '—')}")
     lines.append(f"Обед: {reminders.get('lunch', '—')}")
     lines.append(f"Ужин: {reminders.get('dinner', '—')}")
+    lines.append(f"Вечерняя проверка неучтённого: {EVENING_CHECK_TIME}")
     lines.append("")
     lines.append("Напиши три времени через пробел (завтрак обед ужин), например:\n`08:00 13:30 19:30`")
     lines.append("Чтобы выключить — напиши «выкл».")
+    lines.append("")
+    lines.append("_На каждый опрос жду ответа — кнопкой или просто текстом ('да', 'нет' или что съел). "
+                  "Если через час нет ответа — напомню ещё один раз, и всё._")
     return "\n".join(lines)
 
 
@@ -551,15 +581,17 @@ def handle_food_photo(chat_id: int, photo_sizes: list) -> None:
        reply_markup=food_confirm_keyboard())
 
 
-def handle_food_log(chat_id: int, text: str) -> None:
+def handle_food_log(chat_id: int, text: str, slot: str | None = None) -> None:
     tg("sendChatAction", chat_id=chat_id, action="typing")
+    if slot is None:
+        slot = storage.get_user(chat_id).get("pending_food_slot")
     estimate = food_lookup.estimate(text)
     if not estimate:
         tg("sendMessage", chat_id=chat_id,
            text="Не получилось оценить калорийность — ИИ сейчас недоступен. Попробуй ещё раз чуть позже 🙏",
            reply_markup=back_to_ai_menu_keyboard())
         return
-    storage.save_user(chat_id, {"pending_food": estimate, "ai_state": None})
+    storage.save_user(chat_id, {"pending_food": estimate, "pending_food_slot": slot, "ai_state": None})
     lines = [f"🍽 *{estimate['name']}*"]
     if estimate.get("portion"):
         lines.append(f"Порция: {estimate['portion']}")
@@ -663,20 +695,28 @@ def handle_ai_text(chat_id: int, state: str, text: str) -> None:
         return
 
 
-def handle_reminder_response(chat_id: int, message_id: int, sub_action: str, slot: str) -> None:
+def apply_checkin_response(chat_id: int, slot: str, sub_action: str, message_id: int | None = None) -> None:
+    """Общая логика ответа на опрос "поел ли ты?" — вызывается и из кнопок (AIR),
+    и из свободного текста (см. handle_checkin_text_reply). message_id задан
+    только для кнопок (тогда редактируем то же сообщение вместо нового)."""
     user = storage.get_user(chat_id)
     today = datetime.now(TZ).date().isoformat()
     now_t = datetime.now(TZ).strftime("%H:%M")
     label = MEAL_SLOT_LABELS.get(slot, slot)
+    storage.update_checkin(chat_id, today, slot, {"responded": True})
+
+    def reply(text: str, keyboard: dict | None = None) -> None:
+        if message_id:
+            tg("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
+        else:
+            tg("sendMessage", chat_id=chat_id, text=text, reply_markup=keyboard)
 
     if sub_action == "SKIP":
         storage.add_diary_entry(chat_id, {
             "date": today, "time": now_t, "source": "missed", "slot": slot,
             "name": f"Пропущен приём пищи ({label})", "kcal": 0, "protein": 0, "fat": 0, "carbs": 0,
         })
-        tg("editMessageText", chat_id=chat_id, message_id=message_id,
-           text=f"Записал: {label} пропущен. Бывает — наверстаем в следующий раз 🙂",
-           reply_markup=ai_menu_keyboard(user))
+        reply(f"Записал: {label} пропущен. Бывает — наверстаем в следующий раз 🙂", ai_menu_keyboard(user))
 
     elif sub_action == "OK":
         plan_meal = None
@@ -686,8 +726,7 @@ def handle_reminder_response(chat_id: int, message_id: int, sub_action: str, slo
             weekday = datetime.now(TZ).weekday()
             if slot in order and weekday < len(plan_names):
                 plan_meal = plan_names[weekday][order.index(slot)]
-        tg("editMessageText", chat_id=chat_id, message_id=message_id,
-           text="Отлично! Оцениваю калорийность блюда… 🍽")
+        reply("Отлично! Оцениваю калорийность блюда… 🍽")
         estimate = food_lookup.estimate(plan_meal) if plan_meal else None
         entry = estimate or {"name": plan_meal or label, "portion": "", "kcal": 0, "protein": 0, "fat": 0, "carbs": 0, "note": ""}
         storage.add_diary_entry(chat_id, {"date": today, "time": now_t, "source": "planned", "slot": slot, **entry})
@@ -696,10 +735,42 @@ def handle_reminder_response(chat_id: int, message_id: int, sub_action: str, slo
            reply_markup=ai_menu_keyboard(user))
 
     elif sub_action == "OTHER":
-        storage.save_user(chat_id, {"ai_state": "food_log"})
-        tg("editMessageText", chat_id=chat_id, message_id=message_id,
-           text=f"Что съел вместо запланированного ({label})? Напиши текстом.",
-           reply_markup=back_to_ai_menu_keyboard())
+        storage.save_user(chat_id, {"ai_state": "food_log", "pending_food_slot": slot})
+        reply(f"Что съел вместо запланированного ({label})? Напиши текстом.", back_to_ai_menu_keyboard())
+
+
+def find_pending_checkin_slot(chat_id: int) -> str | None:
+    """Самый старый неотвеченный опрос за сегодня (или None, если таких нет)."""
+    user = storage.get_user(chat_id)
+    today = datetime.now(TZ).date().isoformat()
+    today_checkins = (user.get("checkins") or {}).get(today, {})
+    pending = [(slot, state) for slot, state in today_checkins.items()
+               if state.get("sent") and not state.get("responded")]
+    if not pending:
+        return None
+    pending.sort(key=lambda item: item[1].get("sent", ""))
+    return pending[0][0]
+
+
+def handle_checkin_text_reply(chat_id: int, slot: str, text: str) -> None:
+    """Свободный текстовый ответ на опрос ("да", "нет", или описание того, что съел)."""
+    low = text.strip().lower().rstrip("!.,")
+    if low in ("да", "ага", "угу", "yes", "+"):
+        apply_checkin_response(chat_id, slot, "OK")
+        return
+    if low in ("нет", "не", "no", "-"):
+        apply_checkin_response(chat_id, slot, "SKIP")
+        return
+
+    classification = ai_agent.classify_checkin_reply(text)
+    if classification in ("OK", "SKIP"):
+        apply_checkin_response(chat_id, slot, classification)
+        return
+
+    # OTHER: сам текст уже содержит описание еды — не нужно ждать ещё одно сообщение
+    today = datetime.now(TZ).date().isoformat()
+    storage.update_checkin(chat_id, today, slot, {"responded": True})
+    handle_food_log(chat_id, text, slot)
 
 
 # ---------- Обработка сообщений ----------
@@ -813,6 +884,13 @@ def handle_message(msg: dict) -> None:
             tg("sendMessage", chat_id=chat_id,
                text="Напиши бюджет числом, например: 4000")
         return
+
+    # свободный ответ на опрос "поел ли ты?" — если сейчас есть неотвеченный опрос
+    if text:
+        pending_slot = find_pending_checkin_slot(chat_id)
+        if pending_slot:
+            handle_checkin_text_reply(chat_id, pending_slot, text)
+            return
 
     tg("sendMessage", chat_id=chat_id,
        text="Я работаю кнопками 🙂\n\n"
@@ -965,7 +1043,7 @@ def handle_callback(cb: dict) -> None:
             storage.save_user(chat_id, {"ai_state": None})
             edit("🤖 *ИИ-диетолог*\n\nЧто делаем?", ai_menu_keyboard(user))
         elif sub == "LOG":
-            storage.save_user(chat_id, {"ai_state": "food_log"})
+            storage.save_user(chat_id, {"ai_state": "food_log", "pending_food_slot": None})
             edit("Напиши, что съел — например: «сникерс» или «тарелка борща с хлебом».\n"
                  "Я оценю калории и БЖУ 🍽", back_to_ai_menu_keyboard())
         elif sub == "TODAY":
@@ -1004,19 +1082,46 @@ def handle_callback(cb: dict) -> None:
         if sub == "ADD" and pending:
             today = datetime.now(TZ).date().isoformat()
             now_t = datetime.now(TZ).strftime("%H:%M")
-            storage.add_diary_entry(chat_id, {"date": today, "time": now_t, "source": "logged", **pending})
-            storage.save_user(chat_id, {"pending_food": None, "ai_state": None})
+            entry = {"date": today, "time": now_t, "source": "logged", **pending}
+            if user.get("pending_food_slot"):
+                entry["slot"] = user["pending_food_slot"]
+            storage.add_diary_entry(chat_id, entry)
+            storage.save_user(chat_id, {"pending_food": None, "pending_food_slot": None, "ai_state": None})
             edit(f"✅ Записал: *{pending['name']}* — {pending['kcal']} ккал "
                  f"(Б {pending['protein']} Ж {pending['fat']} У {pending['carbs']})", ai_menu_keyboard(user))
         elif sub == "RETRY":
             storage.save_user(chat_id, {"pending_food": None, "ai_state": "food_log"})
             edit("Хорошо, напиши ещё раз, что съел 🍽", back_to_ai_menu_keyboard())
         else:
-            storage.save_user(chat_id, {"pending_food": None, "ai_state": None})
+            storage.save_user(chat_id, {"pending_food": None, "pending_food_slot": None, "ai_state": None})
             edit("Отменил.", ai_menu_keyboard(user))
 
     elif action == "AIR":
-        handle_reminder_response(chat_id, message_id, parts[1], parts[2])
+        apply_checkin_response(chat_id, parts[2], parts[1], message_id)
+
+    elif action == "EVE":
+        today = datetime.now(TZ).date().isoformat()
+        storage.update_checkin(chat_id, today, EVENING_CHECK_SLOT, {"responded": True})
+        if parts[1] == "OTHER":
+            storage.save_user(chat_id, {"ai_state": "food_log", "pending_food_slot": "snack"})
+            edit("Что ещё ты сегодня съел? Напиши текстом 🍽", back_to_ai_menu_keyboard())
+        else:
+            edit("Отлично, все приёмы пищи за сегодня учтены ✅", ai_menu_keyboard(user))
+
+    elif action == "WK":
+        sub = parts[1]
+        if sub == "KEEP":
+            storage.save_user(chat_id, {"plan_created": datetime.now(TZ).date().isoformat(),
+                                         "plan_renewal_notified": False})
+            edit("Отлично, оставляем текущее меню ещё на неделю 👍", plan_keyboard(0))
+        elif sub == "REGEN":
+            if user.get("goal"):
+                user = build_and_save(chat_id, user)
+                edit(plan_text(user, 0), plan_keyboard(0))
+        elif sub == "SWAP":
+            storage.save_user(chat_id, {"plan_renewal_notified": False})
+            if user.get("plan_names"):
+                edit(plan_text(user, 0), plan_keyboard(0))
 
     elif action == "HOME":
         storage.save_user(chat_id, {"ai_state": None})
@@ -1116,12 +1221,77 @@ def _time_due(scheduled: str, now_hm: str, window_minutes: int = 10) -> bool:
     return 0 <= (now_h * 60 + now_m) - (sched_h * 60 + sched_m) < window_minutes
 
 
+def _minutes_since(sent_hm: str, now: datetime) -> int:
+    try:
+        h, m = (int(x) for x in sent_hm.split(":"))
+    except ValueError:
+        return 0
+    sent_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return int((now - sent_dt).total_seconds() // 60)
+
+
+def _send_checkin_message(chat_id: int, slot: str, followup: bool) -> None:
+    if slot == EVENING_CHECK_SLOT:
+        prefix = "🌙 Напоминаю: всё ли учтено сегодня?" if followup else "🌙 Всё ли учтено сегодня?"
+        text = f"{prefix}\nЕсли был перекус, который не записали — напиши, посчитаю."
+        tg("sendMessage", chat_id=chat_id, text=text, reply_markup=evening_check_keyboard())
+        return
+    label = MEAL_SLOT_LABELS.get(slot, slot)
+    prefix = "⏰ Напоминаю:" if followup else "⏰"
+    tg("sendMessage", chat_id=chat_id, text=f"{prefix} Время приёма пищи: {label}\nПоел по плану?",
+       reply_markup=reminder_response_keyboard(slot))
+
+
+def _tick_checkin(chat_id: int, user: dict, today: str, now: datetime, slot: str, time_str: str) -> int:
+    """Опрос по одному слоту: шлём один раз по расписанию, если через час нет ответа —
+    ровно один повтор, дальше молчим (см. FOLLOWUP_WINDOW_MINUTES)."""
+    state = (user.get("checkins") or {}).get(today, {}).get(slot)
+
+    if state is None:
+        if not _time_due(time_str, now.strftime("%H:%M")):
+            return 0
+        _send_checkin_message(chat_id, slot, followup=False)
+        storage.update_checkin(chat_id, today, slot, {"sent": now.strftime("%H:%M"),
+                                                        "followup_sent": False, "responded": False})
+        return 1
+
+    if state.get("responded") or state.get("followup_sent"):
+        return 0
+
+    sent_hm = state.get("sent")
+    if sent_hm and _minutes_since(sent_hm, now) >= FOLLOWUP_WINDOW_MINUTES:
+        _send_checkin_message(chat_id, slot, followup=True)
+        storage.update_checkin(chat_id, today, slot, {"followup_sent": True})
+        return 1
+    return 0
+
+
+def _tick_weekly_renewal(chat_id: int, user: dict) -> int:
+    """Раз в неделю после создания плана — предлагаем обновить меню. Спрашиваем один раз
+    и не повторяем, пока пользователь не отреагирует (KEEP сбрасывает таймер)."""
+    plan_created = user.get("plan_created")
+    if not plan_created or not user.get("plan_names") or user.get("plan_renewal_notified"):
+        return 0
+    try:
+        created_date = datetime.fromisoformat(plan_created).date()
+    except ValueError:
+        return 0
+    if (datetime.now(TZ).date() - created_date).days < WEEK_DAYS:
+        return 0
+    tg("sendMessage", chat_id=chat_id,
+       text="📅 Прошла неделя с последнего плана питания!\nКак тебе меню — обновляем?",
+       reply_markup=weekly_renewal_keyboard())
+    storage.save_user(chat_id, {"plan_renewal_notified": True})
+    return 1
+
+
 @app.route("/cron/tick")
 def cron_tick():
     """
     Дёргается внешним планировщиком раз в 5-10 минут (PythonAnywhere Tasks
     не годится — там минимум раз в день; используй бесплатный cron-job.org).
-    Рассылает напоминания о приёмах пищи тем, у кого они включены.
+    Рассылает опросы о приёмах пищи, повторяет один раз через час, вечером
+    спрашивает про неучтённые перекусы, раз в неделю предлагает обновить меню.
     """
     if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
         return jsonify(ok=False, error="forbidden"), 403
@@ -1132,23 +1302,18 @@ def cron_tick():
     sent = 0
 
     for chat_id_str, user in storage.all_users().items():
+        chat_id = int(chat_id_str)
         try:
-            if not user.get("reminders_enabled"):
-                continue
-            reminders = user.get("reminders") or {}
-            reminded_today = (user.get("reminded") or {}).get(today, [])
-            for slot, time_str in reminders.items():
-                if not time_str or slot in reminded_today or not _time_due(time_str, now_hm):
-                    continue
-                label = MEAL_SLOT_LABELS.get(slot, slot)
-                tg("sendMessage", chat_id=int(chat_id_str),
-                   text=f"⏰ Время приёма пищи: {label}\nПоел по плану?",
-                   reply_markup=reminder_response_keyboard(slot))
-                storage.mark_reminded(int(chat_id_str), today, slot)
-                sent += 1
+            if user.get("reminders_enabled"):
+                slots = dict(user.get("reminders") or {})
+                slots[EVENING_CHECK_SLOT] = EVENING_CHECK_TIME
+                for slot, time_str in slots.items():
+                    if time_str:
+                        sent += _tick_checkin(chat_id, user, today, now, slot, time_str)
+            sent += _tick_weekly_renewal(chat_id, user)
         except Exception:
             # один сломанный пользователь не должен останавливать рассылку остальным
-            app.logger.exception("Ошибка напоминания для chat_id=%s", chat_id_str)
+            app.logger.exception("Ошибка в cron/tick для chat_id=%s", chat_id_str)
             notify_admin_error(f"cron/tick chat_id={chat_id_str}")
 
     return jsonify(ok=True, sent=sent, checked_at=now_hm)

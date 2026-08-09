@@ -232,6 +232,32 @@ def dietitian_chat(profile_context: str, user_message: str, history: list | None
     return chat(messages, temperature=0.5, max_tokens=500)
 
 
+# ---------- Классификация ответа на опрос "поел ли ты?" ----------
+
+CHECKIN_CLASSIFY_SYSTEM = """Пользователь отвечает на вопрос о приёме пищи ("Позавтракал?" и т.п.).
+Определи по его ответу одно из трёх:
+- OK — да, поел точно по плану, без изменений (например: "да", "да, позавтракал", "все съел как обычно")
+- SKIP — не ел / пропустил приём пищи (например: "нет", "не успел", "пропустил", "забыл")
+- OTHER — ел, но по-другому / другое блюдо / с изменениями — в ответе есть описание еды
+
+Ответь ОДНИМ словом без пояснений: OK, SKIP или OTHER."""
+
+
+def classify_checkin_reply(text: str) -> str:
+    """Классифицирует свободный текстовый ответ на опрос о приёме пищи. Безопасный дефолт — OTHER
+    (трактуем как описание еды), если ИИ недоступен или ответил что-то непонятное."""
+    messages = [
+        {"role": "system", "content": CHECKIN_CLASSIFY_SYSTEM},
+        {"role": "user", "content": text.strip()},
+    ]
+    result = chat(messages, temperature=0.0, max_tokens=5)
+    if result:
+        word = result.strip().upper()
+        if word in ("OK", "SKIP", "OTHER"):
+            return word
+    return "OTHER"
+
+
 # ---------- Еженедельный отчёт ----------
 
 REPORT_SYSTEM = """Ты — ИИ-диетолог. На основе данных дневника питания пользователя за неделю

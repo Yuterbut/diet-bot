@@ -126,3 +126,22 @@ def all_users() -> dict:
     """Все пользователи бота (для рассылки напоминаний по крону), без служебных ключей."""
     data = _read_all()
     return {k: v for k, v in data.items() if k != "_prices" and k.isdigit()}
+
+
+def update_checkin(chat_id: int, date_str: str, slot: str, patch: dict) -> None:
+    """Состояние опроса о приёме пищи: {"sent": "HH:MM", "followup_sent": bool, "responded": bool}.
+    Хранит только последние 3 даты, чтобы файл не рос бесконечно."""
+    data = _read_all()
+    user = data.get(str(chat_id), {})
+    checkins = dict(user.get("checkins", {}))
+    day = dict(checkins.get(date_str, {}))
+    slot_state = dict(day.get(slot, {}))
+    slot_state.update(patch)
+    day[slot] = slot_state
+    checkins[date_str] = day
+    if len(checkins) > 3:
+        for key in sorted(checkins)[:-3]:
+            checkins.pop(key, None)
+    user["checkins"] = checkins
+    data[str(chat_id)] = user
+    _write_all(data)
