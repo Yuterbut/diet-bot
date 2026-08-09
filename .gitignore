@@ -218,3 +218,15 @@ __marimo__/
 .streamlit/secrets.toml
 .env
 data.json
+
+# Local-only working files (notes, reference docs, scratch/test output,
+# tool-specific state) — not part of the bot, never meant for the repo
+.claude/
+.mcp.json
+graphify-out/
+scratch_*.json
+Мои заметки.txt
+*.pdf
+presentation.html
+report_v2.html
+ai_diet_bot_review_report_v2.md
