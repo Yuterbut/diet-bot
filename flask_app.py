@@ -12,6 +12,7 @@ Telegram-бот "Диет-планировщик" — webhook-версия дл�
 
 import os
 import re
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -80,6 +81,20 @@ def tg_photo(chat_id: int, photo_bytes: bytes, caption: str = "") -> None:
                       files={"photo": ("chart.png", photo_bytes, "image/png")}, timeout=20)
     except requests.RequestException as e:
         app.logger.error("Ошибка отправки фото в Telegram: %s", e)
+
+
+def notify_admin_error(context: str) -> None:
+    """Шлёт админу в Telegram уведомление о необработанной ошибке (вместо Sentry,
+    который у нас блокируется сетью). Вызывать только изнутри except-блока."""
+    admin_id = os.getenv("ADMIN_CHAT_ID")
+    if not admin_id:
+        return
+    tb = traceback.format_exc()
+    text = f"⚠️ Ошибка в боте ({context})\n\n{tb[-1500:]}"
+    try:
+        tg("sendMessage", chat_id=int(admin_id), text=text[:4000])
+    except Exception:
+        pass  # уведомление об ошибке не должно само порождать ошибку
 
 
 # ---------- Клавиатуры ----------
@@ -1026,6 +1041,7 @@ def index():
             handle_callback(update["callback_query"])
     except Exception:
         app.logger.exception("Ошибка при обработке обновления")
+        notify_admin_error("webhook")
 
     return jsonify(ok=True)
 
@@ -1116,19 +1132,24 @@ def cron_tick():
     sent = 0
 
     for chat_id_str, user in storage.all_users().items():
-        if not user.get("reminders_enabled"):
-            continue
-        reminders = user.get("reminders") or {}
-        reminded_today = (user.get("reminded") or {}).get(today, [])
-        for slot, time_str in reminders.items():
-            if not time_str or slot in reminded_today or not _time_due(time_str, now_hm):
+        try:
+            if not user.get("reminders_enabled"):
                 continue
-            label = MEAL_SLOT_LABELS.get(slot, slot)
-            tg("sendMessage", chat_id=int(chat_id_str),
-               text=f"⏰ Время приёма пищи: {label}\nПоел по плану?",
-               reply_markup=reminder_response_keyboard(slot))
-            storage.mark_reminded(int(chat_id_str), today, slot)
-            sent += 1
+            reminders = user.get("reminders") or {}
+            reminded_today = (user.get("reminded") or {}).get(today, [])
+            for slot, time_str in reminders.items():
+                if not time_str or slot in reminded_today or not _time_due(time_str, now_hm):
+                    continue
+                label = MEAL_SLOT_LABELS.get(slot, slot)
+                tg("sendMessage", chat_id=int(chat_id_str),
+                   text=f"⏰ Время приёма пищи: {label}\nПоел по плану?",
+                   reply_markup=reminder_response_keyboard(slot))
+                storage.mark_reminded(int(chat_id_str), today, slot)
+                sent += 1
+        except Exception:
+            # один сломанный пользователь не должен останавливать рассылку остальным
+            app.logger.exception("Ошибка напоминания для chat_id=%s", chat_id_str)
+            notify_admin_error(f"cron/tick chat_id={chat_id_str}")
 
     return jsonify(ok=True, sent=sent, checked_at=now_hm)
 
