@@ -294,15 +294,15 @@ def swap_options(plan_names: list, day: int, slot: int, meals_per_day: int,
     return [m["name"] for m in ranked[:limit]]
 
 
-def recipe_meals(plan_names: list) -> list:
-    """Уникальные блюда плана, у которых есть рецепт — в порядке появления."""
+def recipe_meals_for_day(plan_names: list, day: int) -> list:
+    """Уникальные блюда ОДНОГО дня плана, у которых есть рецепт — в порядке появления.
+    Раньше показывали рецепты сразу за всю неделю — длинный нечитаемый список."""
     seen, result = set(), []
-    for day in plan_names:
-        for name in day:
-            meal = meal_by_name(name)
-            if meal and "recipe" in meal and name not in seen:
-                seen.add(name)
-                result.append(name)
+    for name in plan_names[day]:
+        meal = meal_by_name(name)
+        if meal and "recipe" in meal and name not in seen:
+            seen.add(name)
+            result.append(name)
     return result
 
 

@@ -14,6 +14,8 @@
     }
 """
 
+import math
+
 PRODUCTS = {
     # ========== КРУПЫ, МАКАРОНЫ, ХЛЕБ ==========
     "oats":             {"name": "Овсяные хлопья",            "unit": "g",  "pack": 400,  "pack_price": 65,   "category": "крупы"},
@@ -301,10 +303,14 @@ def price_per_unit(product_key: str, region_key: str = DEFAULT_REGION) -> float:
 
 
 def format_amount(product_key: str, amount: float) -> str:
-    """Человекочитаемое количество: 1200 г -> '1.2 кг', 3 pcs -> '3 шт'."""
+    """Человекочитаемое количество: 1200 г -> '1.2 кг', 3 pcs -> '3 шт'.
+
+    Для pcs округляем ВВЕРХ (math.ceil), не к ближайшему: 0.4 авокадо всё равно
+    нужно купить 1 штуку (и список покупок уже считает стоимость по ceil —
+    round() тут раньше показывал "0 шт" за товар, который всё же стоит денег)."""
     unit = PRODUCTS[product_key]["unit"]
     if unit == "pcs":
-        return f"{int(round(amount))} шт"
+        return f"{math.ceil(amount)} шт"
     if amount >= 1000:
         value = amount / 1000
         suffix = "кг" if unit == "g" else "л"

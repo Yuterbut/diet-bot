@@ -164,8 +164,8 @@ def plan_keyboard(day: int = 0, total_days: int = 7):
             {"text": "▶️", "callback_data": f"DAY|{next_day}"},
         ],
         [{"text": "🔁 Заменить блюдо", "callback_data": f"SWAP|{day}"}],
-        [{"text": "👨‍🍳 Рецепты", "callback_data": "RECIPES"}],
-        [{"text": "🛒 Список покупок", "callback_data": "SHOP"}],
+        [{"text": "👨‍🍳 Рецепты", "callback_data": f"RECIPES|{day}"}],
+        [{"text": "🛒 Список покупок", "callback_data": f"SHOP|{day}"}],
         [{"text": "🔄 Другой вариант", "callback_data": "REGEN"},
          {"text": "⚙️ Заново", "callback_data": "START"}],
         [{"text": "🤖 ИИ-диетолог", "callback_data": "AI|START"}],
@@ -190,29 +190,69 @@ def swap_options_keyboard(day: int, slot: int, options: list):
     return {"inline_keyboard": rows}
 
 
-def recipes_keyboard(names: list, day: int = 0):
-    rows = [[{"text": f"👨‍🍳 {name}", "callback_data": f"RC|{i}"}]
+def recipes_keyboard(names: list, day: int):
+    rows = [[{"text": f"👨‍🍳 {name}", "callback_data": f"RC|{day}|{i}"}]
             for i, name in enumerate(names)]
     rows.append([{"text": "⬅️ Назад к меню", "callback_data": f"DAY|{day}"}])
     return {"inline_keyboard": rows}
 
 
-def recipe_back_keyboard():
+def recipe_back_keyboard(day: int):
     return {"inline_keyboard": [
-        [{"text": "⬅️ К списку рецептов", "callback_data": "RECIPES"}],
-        [{"text": "📋 К меню", "callback_data": "DAY|0"}],
+        [{"text": "⬅️ К списку рецептов", "callback_data": f"RECIPES|{day}"}],
+        [{"text": "📋 К меню", "callback_data": f"DAY|{day}"}],
     ]}
 
 
-def shopping_keyboard(items: list, bought: list):
+CATEGORY_EMOJI = {
+    "крупы": "🌾", "макароны": "🍝", "хлеб": "🍞", "мука": "🌾",
+    "птица": "🍗", "мясо": "🥩", "яйца": "🥚", "рыба": "🐟", "морепродукты": "🦐",
+    "молочное": "🥛", "раст_молоко": "🥥", "овощи": "🥦", "зелень": "🌿",
+    "консервы": "🥫", "грибы": "🍄", "фрукты": "🍎", "ягоды": "🫐",
+    "бобовые": "🫘", "раст_белок": "🌱", "орехи": "🥜", "семена": "🌻",
+    "сухофрукты": "🍇", "масла": "🫒", "соусы": "🧂", "специи": "🧂",
+    "сладости": "🍬", "спортпит": "💪", "напитки": "☕", "прочее": "📦",
+}
+
+
+def _item_category(item: dict) -> str:
+    return PRODUCTS.get(item["key"], {}).get("category", "прочее")
+
+
+def _items_by_category(items: list) -> dict:
+    """key -> список исходных индексов (индекс важен: 'bought' и 'T|' ссылаются на него)."""
+    cats: dict[str, list[int]] = {}
+    for i, item in enumerate(items):
+        cats.setdefault(_item_category(item), []).append(i)
+    return cats
+
+
+def shopping_categories_keyboard(items: list, bought: list, day: int) -> dict:
+    """Список покупок разгружен по категориям — раньше все продукты шли одним
+    длинным списком кнопок, теперь сначала категории, потом состав внутри."""
+    cats = _items_by_category(items)
+    rows = []
+    for cat, idxs in sorted(cats.items(), key=lambda kv: -len(kv[1])):
+        done = sum(1 for i in idxs if i in bought)
+        emoji = CATEGORY_EMOJI.get(cat, "📦")
+        mark = " ✅" if done == len(idxs) else ""
+        rows.append([{"text": f"{emoji} {cat.capitalize()} ({done}/{len(idxs)}){mark}",
+                      "callback_data": f"SHOPCAT|{day}|{cat}"}])
+    rows.append([{"text": "📋 Вернуться к меню", "callback_data": f"DAY|{day}"}])
+    return {"inline_keyboard": rows}
+
+
+def shopping_category_keyboard(items: list, bought: list, day: int, category: str) -> dict:
     rows = []
     for i, item in enumerate(items):
+        if _item_category(item) != category:
+            continue
         box = "✅" if i in bought else "⬜️"
         rows.append([{
             "text": f"{box} {item['name']} · {item['amount_text']} · {item['cost']} ₽",
-            "callback_data": f"T|{i}",
+            "callback_data": f"T|{day}|{category}|{i}",
         }])
-    rows.append([{"text": "📋 Вернуться к меню", "callback_data": "DAY|0"}])
+    rows.append([{"text": "⬅️ К категориям", "callback_data": f"SHOP|{day}"}])
     return {"inline_keyboard": rows}
 
 
@@ -315,6 +355,22 @@ def shopping_text(user: dict) -> str:
 
     lines = ["🛒 *Список покупок на неделю*", ""]
     lines.append(f"Отмечено: {done} из {total_items}")
+    lines.append(f"Осталось купить примерно на *{round(remaining)} ₽*")
+    lines.append("")
+    lines.append("_Выбери категорию, чтобы отметить покупки._")
+    return "\n".join(lines)
+
+
+def shopping_category_text(user: dict, category: str) -> str:
+    items = user.get("items", [])
+    bought = set(user.get("bought", []))
+    cat_indices = [i for i, item in enumerate(items) if _item_category(item) == category]
+    remaining = sum(items[i]["cost"] for i in cat_indices if i not in bought)
+    done = sum(1 for i in cat_indices if i in bought)
+    emoji = CATEGORY_EMOJI.get(category, "📦")
+
+    lines = [f"{emoji} *{category.capitalize()}*", ""]
+    lines.append(f"Отмечено: {done} из {len(cat_indices)}")
     lines.append(f"Осталось купить примерно на *{round(remaining)} ₽*")
     lines.append("")
     lines.append("_Нажимай на продукт, чтобы отметить покупку._")
@@ -1022,21 +1078,24 @@ def handle_callback(cb: dict) -> None:
             return
 
     elif action == "RECIPES":
-        names = planner.recipe_meals(user.get("plan_names", []))
+        day = int(parts[1]) if len(parts) > 1 else 0
+        plan_names = user.get("plan_names", [])
+        names = planner.recipe_meals_for_day(plan_names, day) if plan_names else []
         if names:
             storage.save_user(chat_id, {"recipe_names": names})
-            edit("👨‍🍳 *Блюда недели, которые нужно готовить*\n\n"
+            edit(f"👨‍🍳 *Блюда дня {day + 1}, которые нужно готовить*\n\n"
                  "Выбери блюдо — покажу пошаговый рецепт.",
-                 recipes_keyboard(names))
+                 recipes_keyboard(names, day))
         else:
-            edit("В этом меню нет блюд, требующих долгой готовки 🙂",
-                 plan_keyboard(0))
+            edit("В этот день нет блюд, требующих долгой готовки 🙂",
+                 plan_keyboard(day))
 
     elif action == "RC":
+        day = int(parts[1])
+        idx = int(parts[2])
         names = user.get("recipe_names", [])
-        idx = int(parts[1])
         if idx < len(names):
-            edit(planner.format_recipe(names[idx]), recipe_back_keyboard())
+            edit(planner.format_recipe(names[idx]), recipe_back_keyboard(day))
             photo_url = photos.search_dish_photo(names[idx])
             if photo_url:
                 resp = tg("sendPhoto", chat_id=chat_id, photo=photo_url, caption=names[idx])
@@ -1044,15 +1103,23 @@ def handle_callback(cb: dict) -> None:
                 storage.save_user(chat_id, {"last_recipe_photo_id": new_id})
 
     elif action == "SHOP":
+        day = int(parts[1]) if len(parts) > 1 else 0
         if user.get("items"):
-            edit(shopping_text(user), shopping_keyboard(user["items"], user.get("bought", [])))
+            edit(shopping_text(user), shopping_categories_keyboard(user["items"], user.get("bought", []), day))
+
+    elif action == "SHOPCAT":
+        day, category = int(parts[1]), parts[2]
+        if user.get("items"):
+            edit(shopping_category_text(user, category),
+                 shopping_category_keyboard(user["items"], user.get("bought", []), day, category))
 
     elif action == "T":
-        idx = int(parts[1])
+        day, category, idx = int(parts[1]), parts[2], int(parts[3])
         bought = list(user.get("bought", []))
         bought.remove(idx) if idx in bought else bought.append(idx)
         user = storage.save_user(chat_id, {"bought": bought})
-        edit(shopping_text(user), shopping_keyboard(user["items"], bought))
+        edit(shopping_category_text(user, category),
+             shopping_category_keyboard(user["items"], bought, day, category))
 
     elif action == "AI":
         sub = parts[1]
