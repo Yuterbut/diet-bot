@@ -83,13 +83,21 @@ def tg(method: str, **payload):
         return {}
 
 
-def tg_photo(chat_id: int, photo_bytes: bytes, caption: str = "") -> None:
-    """Отправляет сгенерированную картинку (для sendPhoto по URL используем обычный tg())."""
+def tg_photo(chat_id: int, photo_bytes: bytes, caption: str = "") -> int | None:
+    """Отправляет сгенерированную картинку. Возвращает message_id (для последующего
+    удаления при переходе на другой экран) или None при сбое."""
     try:
-        requests.post(f"{API_URL}/sendPhoto", data={"chat_id": chat_id, "caption": caption},
-                      files={"photo": ("chart.png", photo_bytes, "image/png")}, timeout=20)
+        resp = requests.post(f"{API_URL}/sendPhoto", data={"chat_id": chat_id, "caption": caption},
+                              files={"photo": ("chart.png", photo_bytes, "image/png")}, timeout=20)
+        return resp.json().get("result", {}).get("message_id")
     except requests.RequestException as e:
         app.logger.error("Ошибка отправки фото в Telegram: %s", e)
+        return None
+
+
+def tg_delete(chat_id: int, message_id: int | None) -> None:
+    if message_id:
+        tg("deleteMessage", chat_id=chat_id, message_id=message_id)
 
 
 def notify_admin_error(context: str) -> None:
@@ -518,7 +526,8 @@ def send_week_chart(chat_id: int, user: dict) -> None:
         target_kcal = nutrition.full_profile_targets(profile, user.get("goal", "maintain"))["kcal"]
     try:
         png_bytes = charts.week_kcal_chart(series, target_kcal)
-        tg_photo(chat_id, png_bytes)
+        new_id = tg_photo(chat_id, png_bytes)
+        storage.save_user(chat_id, {"last_chart_photo_id": new_id})
     except Exception as e:
         app.logger.error("Ошибка построения графика недели: %s", e)
 
@@ -911,6 +920,14 @@ def handle_callback(cb: dict) -> None:
     user = storage.get_user(chat_id)
 
     def edit(text: str, keyboard: dict) -> None:
+        # рецепт/график шлются отдельными сообщениями (Telegram не даёт вставить
+        # картинку в текстовое) — при любом переходе на другой экран подчищаем
+        # то, что осталось от предыдущего, иначе фото копятся в чате.
+        stray = user.get("last_recipe_photo_id"), user.get("last_chart_photo_id")
+        if any(stray):
+            for mid in stray:
+                tg_delete(chat_id, mid)
+            storage.save_user(chat_id, {"last_recipe_photo_id": None, "last_chart_photo_id": None})
         tg("editMessageText", chat_id=chat_id, message_id=message_id,
            text=text, parse_mode="Markdown", reply_markup=keyboard)
 
@@ -1022,7 +1039,9 @@ def handle_callback(cb: dict) -> None:
             edit(planner.format_recipe(names[idx]), recipe_back_keyboard())
             photo_url = photos.search_dish_photo(names[idx])
             if photo_url:
-                tg("sendPhoto", chat_id=chat_id, photo=photo_url, caption=names[idx])
+                resp = tg("sendPhoto", chat_id=chat_id, photo=photo_url, caption=names[idx])
+                new_id = resp.get("result", {}).get("message_id")
+                storage.save_user(chat_id, {"last_recipe_photo_id": new_id})
 
     elif action == "SHOP":
         if user.get("items"):
