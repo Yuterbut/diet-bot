@@ -12,12 +12,16 @@ Telegram-бот "Диет-планировщик" — webhook-версия дл�
 
 import os
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
+import ai_agent
+import nutrition
 import planner
 import storage
 from meals_data import BUDGET_PRESETS, GOAL_LABELS, MEAL_TYPE_LABELS, RESTRICTION_LABELS
@@ -34,6 +38,16 @@ app = Flask(__name__)
 
 RESTRICTION_KEYS = list(RESTRICTION_LABELS.keys())
 WELCOME = "Привет! 👋 Составлю план питания на неделю с учётом бюджета.\n\nКакая у тебя цель?"
+
+# ---------- ИИ-диетолог: константы ----------
+
+TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+
+SEX_LABELS = {"m": "Мужской", "f": "Женский"}
+MEAL_SLOT_LABELS = {"breakfast": "🌅 Завтрак", "lunch": "🥗 Обед", "dinner": "🍽 Ужин", "snack": "🍎 Перекус"}
+DEFAULT_REMINDERS = {"breakfast": "08:30", "lunch": "13:30", "dinner": "19:30"}
+PROFILE_SEQUENCE = ["sex", "age", "height", "weight", "activity"]
 
 
 def tg(method: str, **payload):
@@ -52,6 +66,7 @@ def goal_keyboard():
         [{"text": "📈 Набор массы", "callback_data": "G|gain"}],
         [{"text": "⚖️ Поддержание веса", "callback_data": "G|maintain"}],
         [{"text": "🎲 Просто разнообразие", "callback_data": "G|variety"}],
+        [{"text": "🤖 ИИ-диетолог (тест)", "callback_data": "AI|START"}],
     ]}
 
 
@@ -144,6 +159,55 @@ def shopping_keyboard(items: list, bought: list):
     return {"inline_keyboard": rows}
 
 
+def sex_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "👨 Мужской", "callback_data": "AIS|m"}, {"text": "👩 Женский", "callback_data": "AIS|f"}],
+    ]}
+
+
+def activity_keyboard():
+    rows = [[{"text": label, "callback_data": f"AIA|{key}"}]
+            for key, (label, _) in nutrition.ACTIVITY_LEVELS.items()]
+    return {"inline_keyboard": rows}
+
+
+def measurements_prompt_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "✏️ Указать объёмы", "callback_data": "AIM|YES"}],
+        [{"text": "⏭ Пропустить", "callback_data": "AIM|NO"}],
+    ]}
+
+
+def ai_menu_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "📝 Записать приём пищи", "callback_data": "AI|LOG"}],
+        [{"text": "📊 Сегодня", "callback_data": "AI|TODAY"}, {"text": "📈 Неделя", "callback_data": "AI|WEEK"}],
+        [{"text": "⏰ Напоминания", "callback_data": "AI|REMIND"}],
+        [{"text": "💬 Спросить диетолога", "callback_data": "AI|ASK"}],
+        [{"text": "👤 Анкета", "callback_data": "AI|PROFILE"}],
+    ]}
+
+
+def reminder_response_keyboard(slot: str):
+    return {"inline_keyboard": [
+        [{"text": "✅ Поел по плану", "callback_data": f"AIR|OK|{slot}"}],
+        [{"text": "🍽 Ел другое", "callback_data": f"AIR|OTHER|{slot}"}],
+        [{"text": "➖ Пропустил", "callback_data": f"AIR|SKIP|{slot}"}],
+    ]}
+
+
+def food_confirm_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "✅ Добавить в дневник", "callback_data": "AIL|ADD"}],
+        [{"text": "🔄 Написать заново", "callback_data": "AIL|RETRY"}],
+        [{"text": "❌ Отмена", "callback_data": "AIL|CANCEL"}],
+    ]}
+
+
+def back_to_ai_menu_keyboard():
+    return {"inline_keyboard": [[{"text": "⬅️ В меню диетолога", "callback_data": "AI|MENU"}]]}
+
+
 # ---------- Формирование сообщений ----------
 
 def plan_text(user: dict, day: int = 0) -> str:
@@ -197,6 +261,335 @@ def build_and_save(chat_id: int, user: dict) -> dict:
         "bought": [],
         "awaiting_budget": False,
     })
+
+
+# ---------- ИИ-диетолог: анкета, дневник, напоминания ----------
+
+def ai_missing_field(profile: dict) -> str | None:
+    """Следующий незаполненный шаг анкеты, либо None если анкета готова."""
+    for field in PROFILE_SEQUENCE:
+        if profile.get(field) is None:
+            return field
+    if not profile.get("measurements_asked"):
+        return "measurements_choice"
+    return None
+
+
+def ai_profile_context(user: dict) -> str:
+    """Короткое текстовое summary для промпта ИИ (профиль + КБЖУ за сегодня)."""
+    p = user.get("profile", {})
+    parts = []
+    if p.get("sex"):
+        parts.append(f"пол: {SEX_LABELS.get(p['sex'], p['sex'])}")
+    if p.get("age"):
+        parts.append(f"возраст: {p['age']}")
+    if p.get("height"):
+        parts.append(f"рост: {p['height']} см")
+    if p.get("weight"):
+        parts.append(f"вес: {p['weight']} кг")
+    goal = user.get("goal")
+    if goal:
+        parts.append(f"цель: {GOAL_LABELS.get(goal, goal)}")
+    if nutrition.profile_complete(p):
+        target = nutrition.full_profile_targets(p, goal or "maintain")
+        parts.append(f"дневная норма: {target['kcal']} ккал")
+        today = datetime.now(TZ).date().isoformat()
+        totals, _ = diary_day_totals(user.get("diary", []), today)
+        parts.append(f"уже съедено сегодня: {totals['kcal']} ккал")
+    return "; ".join(parts)
+
+
+def ai_profile_text(user: dict) -> str:
+    p = user.get("profile", {})
+    lines = ["👤 *Анкета*", ""]
+    lines.append(f"Пол: {SEX_LABELS.get(p.get('sex'), '—')}")
+    lines.append(f"Возраст: {p.get('age', '—')}")
+    lines.append(f"Рост: {p.get('height', '—')} см")
+    lines.append(f"Вес: {p.get('weight', '—')} кг")
+    activity = nutrition.ACTIVITY_LEVELS.get(p.get("activity"))
+    lines.append(f"Активность: {activity[0] if activity else '—'}")
+    if p.get("waist"):
+        lines.append(f"Талия: {p['waist']} см")
+    if p.get("hips"):
+        lines.append(f"Бёдра: {p['hips']} см")
+    if p.get("chest"):
+        lines.append(f"Грудь: {p['chest']} см")
+    if nutrition.profile_complete(p):
+        goal = user.get("goal", "maintain")
+        target = nutrition.full_profile_targets(p, goal)
+        lines.append("")
+        lines.append(f"🎯 Дневная норма (*{GOAL_LABELS.get(goal, 'поддержание')}*): *{target['kcal']} ккал*")
+        lines.append(f"Б {target['protein']} г · Ж {target['fat']} г · У {target['carbs']} г")
+    return "\n".join(lines)
+
+
+def ai_advance(chat_id: int, message_id: int | None = None) -> None:
+    """Отправляет следующий шаг анкеты либо, если анкета готова, — меню ИИ-диетолога."""
+    user = storage.get_user(chat_id)
+    profile = user.get("profile", {})
+    missing = ai_missing_field(profile)
+
+    def send(text: str, keyboard: dict) -> None:
+        if message_id:
+            tg("editMessageText", chat_id=chat_id, message_id=message_id,
+               text=text, parse_mode="Markdown", reply_markup=keyboard)
+        else:
+            tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
+
+    if missing == "sex":
+        send("Для расчёта дневной нормы калорий пройдём короткую анкету 📋\n\nТвой пол?", sex_keyboard())
+    elif missing == "age":
+        storage.save_user(chat_id, {"ai_state": "age"})
+        tg("sendMessage", chat_id=chat_id, text="Сколько тебе лет?")
+    elif missing == "height":
+        storage.save_user(chat_id, {"ai_state": "height"})
+        tg("sendMessage", chat_id=chat_id, text="Рост в сантиметрах?")
+    elif missing == "weight":
+        storage.save_user(chat_id, {"ai_state": "weight"})
+        tg("sendMessage", chat_id=chat_id, text="Текущий вес в кг?")
+    elif missing == "activity":
+        send("Какой уровень активности у тебя в среднем за неделю?", activity_keyboard())
+    elif missing == "measurements_choice":
+        send("Хочешь также указать объёмы (талия/бёдра/грудь)?\nНе обязательно — можно добавить позже.",
+             measurements_prompt_keyboard())
+    else:
+        if not user.get("goal"):
+            storage.save_user(chat_id, {"goal": "maintain"})
+            user = storage.get_user(chat_id)
+        text = "✅ Анкета готова!\n\n" + ai_profile_text(user)
+        send(text, ai_menu_keyboard())
+
+
+def diary_day_totals(diary: list, date_str: str) -> tuple[dict, list]:
+    entries = [e for e in diary if e.get("date") == date_str]
+    totals = {"kcal": 0, "protein": 0, "fat": 0, "carbs": 0}
+    for e in entries:
+        for k in totals:
+            totals[k] += e.get(k, 0) or 0
+    return totals, entries
+
+
+def ai_today_text(user: dict) -> str:
+    diary = user.get("diary", [])
+    today = datetime.now(TZ).date().isoformat()
+    totals, entries = diary_day_totals(diary, today)
+    lines = ["📊 *Сегодня*", ""]
+    if not entries:
+        lines.append("Пока ничего не записано.")
+    else:
+        marks = {"missed": "➖", "planned": "✅", "logged": "🍽"}
+        for e in entries:
+            mark = marks.get(e.get("source"), "•")
+            lines.append(f"{mark} {e.get('time', '')} — {e.get('name', '?')} ({e.get('kcal', 0)} ккал)")
+    lines.append("")
+    lines.append(f"Итого: *{totals['kcal']} ккал* · Б {totals['protein']} Ж {totals['fat']} У {totals['carbs']}")
+
+    profile = user.get("profile", {})
+    if nutrition.profile_complete(profile):
+        target = nutrition.full_profile_targets(profile, user.get("goal", "maintain"))
+        remaining = target["kcal"] - totals["kcal"]
+        status = f"осталось {remaining}" if remaining >= 0 else f"превышение на {-remaining}"
+        lines.append(f"Норма: {target['kcal']} ккал ({status})")
+    return "\n".join(lines)
+
+
+def ai_week_text(user: dict) -> str:
+    diary = user.get("diary", [])
+    today = datetime.now(TZ).date()
+    days = [(today - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
+
+    profile = user.get("profile", {})
+    target_kcal = None
+    if nutrition.profile_complete(profile):
+        target_kcal = nutrition.full_profile_targets(profile, user.get("goal", "maintain"))["kcal"]
+
+    day_lines, summary_rows = [], []
+    for d in days:
+        totals, entries = diary_day_totals(diary, d)
+        if not entries:
+            continue
+        weekday = datetime.fromisoformat(d).strftime("%a")
+        mark = ""
+        if target_kcal:
+            mark = " ✅" if totals["kcal"] <= target_kcal * 1.1 else " ⚠️"
+        day_lines.append(f"{d} ({weekday}): {totals['kcal']} ккал{mark}")
+        summary_rows.append(f"{d}: {totals['kcal']} ккал, Б{totals['protein']}/Ж{totals['fat']}/У{totals['carbs']}")
+
+    if not day_lines:
+        return "📈 *Неделя*\n\nЗа последние 7 дней в дневнике пока пусто."
+
+    header = "📈 *Отчёт за неделю*\n\n" + "\n".join(day_lines)
+    prompt_data = (f"Цель: {user.get('goal', 'maintain')}. "
+                   f"Дневная норма: {target_kcal or 'неизвестна'} ккал.\n" + "\n".join(summary_rows))
+    ai_text = ai_agent.weekly_report(prompt_data)
+    if ai_text:
+        header += "\n\n" + ai_text
+    return header
+
+
+def ai_remind_text(user: dict) -> str:
+    reminders = user.get("reminders") or DEFAULT_REMINDERS
+    enabled = user.get("reminders_enabled", False)
+    lines = ["⏰ *Напоминания о приёмах пищи*", ""]
+    lines.append(f"Статус: {'включены ✅' if enabled else 'выключены'}")
+    lines.append(f"Завтрак: {reminders.get('breakfast', '—')}")
+    lines.append(f"Обед: {reminders.get('lunch', '—')}")
+    lines.append(f"Ужин: {reminders.get('dinner', '—')}")
+    lines.append("")
+    lines.append("Напиши три времени через пробел (завтрак обед ужин), например:\n`08:00 13:30 19:30`")
+    lines.append("Чтобы выключить — напиши «выкл».")
+    return "\n".join(lines)
+
+
+def handle_food_log(chat_id: int, text: str) -> None:
+    tg("sendChatAction", chat_id=chat_id, action="typing")
+    estimate = ai_agent.estimate_food(text)
+    if not estimate:
+        tg("sendMessage", chat_id=chat_id,
+           text="Не получилось оценить калорийность — ИИ сейчас недоступен. Попробуй ещё раз чуть позже 🙏",
+           reply_markup=back_to_ai_menu_keyboard())
+        return
+    storage.save_user(chat_id, {"pending_food": estimate, "ai_state": None})
+    lines = [f"🍽 *{estimate['name']}*"]
+    if estimate.get("portion"):
+        lines.append(f"Порция: {estimate['portion']}")
+    lines.append(f"*{estimate['kcal']} ккал* · Б {estimate['protein']} Ж {estimate['fat']} У {estimate['carbs']}")
+    if estimate.get("note"):
+        lines.append(f"_{estimate['note']}_")
+    tg("sendMessage", chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown",
+       reply_markup=food_confirm_keyboard())
+
+
+def handle_ai_question(chat_id: int, user: dict, text: str) -> None:
+    tg("sendChatAction", chat_id=chat_id, action="typing")
+    context = ai_profile_context(user)
+    reply = ai_agent.dietitian_chat(context, text)
+    storage.save_user(chat_id, {"ai_state": None})
+    if not reply:
+        tg("sendMessage", chat_id=chat_id, text="ИИ сейчас недоступен, попробуй чуть позже 🙏",
+           reply_markup=ai_menu_keyboard())
+        return
+    tg("sendMessage", chat_id=chat_id, text=reply, reply_markup=ai_menu_keyboard())
+
+
+def handle_reminder_times(chat_id: int, text: str) -> None:
+    low = text.strip().lower()
+    if low in ("выкл", "выключить", "off"):
+        storage.save_user(chat_id, {"reminders_enabled": False, "ai_state": None})
+        tg("sendMessage", chat_id=chat_id, text="Напоминания выключены.", reply_markup=ai_menu_keyboard())
+        return
+
+    times = text.split()
+    if len(times) != 3 or not all(re.fullmatch(r"[0-2]\d:[0-5]\d", t) for t in times):
+        tg("sendMessage", chat_id=chat_id,
+           text="Не понял формат. Напиши три времени через пробел, например: 08:00 13:30 19:30\n"
+                "Или «выкл», чтобы отключить напоминания.")
+        return
+
+    reminders = {"breakfast": times[0], "lunch": times[1], "dinner": times[2]}
+    storage.save_user(chat_id, {"reminders": reminders, "reminders_enabled": True, "ai_state": None})
+    tg("sendMessage", chat_id=chat_id, text="✅ Напоминания настроены.", reply_markup=ai_menu_keyboard())
+
+
+def handle_ai_text(chat_id: int, state: str, text: str) -> None:
+    text = text.strip()
+
+    if state == "age":
+        if not text.isdigit() or not (10 <= int(text) <= 100):
+            tg("sendMessage", chat_id=chat_id, text="Введи возраст числом от 10 до 100.")
+            return
+        storage.update_profile(chat_id, {"age": int(text)})
+        ai_advance(chat_id)
+        return
+
+    if state in ("height", "weight"):
+        try:
+            value = float(text.replace(",", "."))
+        except ValueError:
+            value = None
+        bounds = {"height": (100, 250), "weight": (30, 300)}[state]
+        if value is None or not (bounds[0] <= value <= bounds[1]):
+            hint = "рост в сантиметрах, например 175" if state == "height" else "вес в кг, например 68"
+            tg("sendMessage", chat_id=chat_id, text=f"Введи {hint}.")
+            return
+        storage.update_profile(chat_id, {state: value})
+        ai_advance(chat_id)
+        return
+
+    if state in ("waist", "hips", "chest"):
+        if text in ("-", "—", "нет", "пропустить"):
+            value = None
+        else:
+            try:
+                value = float(text.replace(",", "."))
+                if not (30 <= value <= 250):
+                    raise ValueError
+            except ValueError:
+                tg("sendMessage", chat_id=chat_id, text="Напиши число в см или «-», чтобы пропустить.")
+                return
+        if value is not None:
+            storage.update_profile(chat_id, {state: value})
+        next_map = {"waist": "hips", "hips": "chest", "chest": None}
+        nxt = next_map[state]
+        if nxt:
+            storage.save_user(chat_id, {"ai_state": nxt})
+            labels = {"hips": "бёдер", "chest": "груди"}
+            tg("sendMessage", chat_id=chat_id, text=f"Объём {labels[nxt]} в см? (или «-», чтобы пропустить)")
+        else:
+            storage.update_profile(chat_id, {"measurements_asked": True})
+            ai_advance(chat_id)
+        return
+
+    if state == "food_log":
+        handle_food_log(chat_id, text)
+        return
+
+    if state == "ask":
+        handle_ai_question(chat_id, storage.get_user(chat_id), text)
+        return
+
+    if state == "reminder_times":
+        handle_reminder_times(chat_id, text)
+        return
+
+
+def handle_reminder_response(chat_id: int, message_id: int, sub_action: str, slot: str) -> None:
+    user = storage.get_user(chat_id)
+    today = datetime.now(TZ).date().isoformat()
+    now_t = datetime.now(TZ).strftime("%H:%M")
+    label = MEAL_SLOT_LABELS.get(slot, slot)
+
+    if sub_action == "SKIP":
+        storage.add_diary_entry(chat_id, {
+            "date": today, "time": now_t, "source": "missed", "slot": slot,
+            "name": f"Пропущен приём пищи ({label})", "kcal": 0, "protein": 0, "fat": 0, "carbs": 0,
+        })
+        tg("editMessageText", chat_id=chat_id, message_id=message_id,
+           text=f"Записал: {label} пропущен. Бывает — наверстаем в следующий раз 🙂",
+           reply_markup=ai_menu_keyboard())
+
+    elif sub_action == "OK":
+        plan_meal = None
+        plan_names = user.get("plan_names")
+        if plan_names:
+            order = planner.MEAL_ORDER_5 if user.get("meals_per_day") == 5 else planner.MEAL_ORDER_3
+            weekday = datetime.now(TZ).weekday()
+            if slot in order and weekday < len(plan_names):
+                plan_meal = plan_names[weekday][order.index(slot)]
+        tg("editMessageText", chat_id=chat_id, message_id=message_id,
+           text="Отлично! Оцениваю калорийность блюда… 🍽")
+        estimate = ai_agent.estimate_food(plan_meal) if plan_meal else None
+        entry = estimate or {"name": plan_meal or label, "portion": "", "kcal": 0, "protein": 0, "fat": 0, "carbs": 0, "note": ""}
+        storage.add_diary_entry(chat_id, {"date": today, "time": now_t, "source": "planned", "slot": slot, **entry})
+        tg("sendMessage", chat_id=chat_id,
+           text=f"✅ Записал: *{entry['name']}* — {entry['kcal']} ккал", parse_mode="Markdown",
+           reply_markup=ai_menu_keyboard())
+
+    elif sub_action == "OTHER":
+        storage.save_user(chat_id, {"ai_state": "food_log"})
+        tg("editMessageText", chat_id=chat_id, message_id=message_id,
+           text=f"Что съел вместо запланированного ({label})? Напиши текстом.",
+           reply_markup=back_to_ai_menu_keyboard())
 
 
 # ---------- Обработка сообщений ----------
@@ -268,7 +661,16 @@ def handle_message(msg: dict) -> None:
         handle_products_command(chat_id)
         return
 
+    if low.startswith(("/ai", "/диетолог")):
+        ai_advance(chat_id)
+        return
+
     user = storage.get_user(chat_id)
+
+    # диалог с ИИ-диетологом (анкета / запись еды / вопрос / напоминания)
+    if user.get("ai_state"):
+        handle_ai_text(chat_id, user["ai_state"], text)
+        return
 
     # ждём от пользователя сумму бюджета
     if user.get("awaiting_budget"):
@@ -292,6 +694,7 @@ def handle_message(msg: dict) -> None:
     tg("sendMessage", chat_id=chat_id,
        text="Я работаю кнопками 🙂\n\n"
             "/start — составить план питания\n"
+            "/ai — ИИ-диетолог (анкета, дневник КБЖУ, напоминания)\n"
             "/продукты — список продуктов и цен\n"
             "/цена — обновить цену продукта")
 
@@ -427,6 +830,66 @@ def handle_callback(cb: dict) -> None:
         user = storage.save_user(chat_id, {"bought": bought})
         edit(shopping_text(user), shopping_keyboard(user["items"], bought))
 
+    elif action == "AI":
+        sub = parts[1]
+        if sub == "START":
+            ai_advance(chat_id, message_id)
+        elif sub == "MENU":
+            storage.save_user(chat_id, {"ai_state": None})
+            edit("🤖 *ИИ-диетолог*\n\nЧто делаем?", ai_menu_keyboard())
+        elif sub == "LOG":
+            storage.save_user(chat_id, {"ai_state": "food_log"})
+            edit("Напиши, что съел — например: «сникерс» или «тарелка борща с хлебом».\n"
+                 "Я оценю калории и БЖУ 🍽", back_to_ai_menu_keyboard())
+        elif sub == "TODAY":
+            edit(ai_today_text(user), back_to_ai_menu_keyboard())
+        elif sub == "WEEK":
+            edit(ai_week_text(user), back_to_ai_menu_keyboard())
+        elif sub == "REMIND":
+            storage.save_user(chat_id, {"ai_state": "reminder_times"})
+            edit(ai_remind_text(user), back_to_ai_menu_keyboard())
+        elif sub == "ASK":
+            storage.save_user(chat_id, {"ai_state": "ask"})
+            edit("Спроси что-нибудь про питание — отвечу как диетолог 💬", back_to_ai_menu_keyboard())
+        elif sub == "PROFILE":
+            edit(ai_profile_text(user), back_to_ai_menu_keyboard())
+
+    elif action == "AIS":
+        storage.update_profile(chat_id, {"sex": parts[1]})
+        ai_advance(chat_id, message_id)
+
+    elif action == "AIA":
+        storage.update_profile(chat_id, {"activity": parts[1]})
+        ai_advance(chat_id, message_id)
+
+    elif action == "AIM":
+        if parts[1] == "YES":
+            storage.save_user(chat_id, {"ai_state": "waist"})
+            edit("Объём талии в см? (или «-», чтобы пропустить)", back_to_ai_menu_keyboard())
+        else:
+            storage.update_profile(chat_id, {"measurements_asked": True})
+            ai_advance(chat_id, message_id)
+
+    elif action == "AIL":
+        sub = parts[1]
+        pending = user.get("pending_food")
+        if sub == "ADD" and pending:
+            today = datetime.now(TZ).date().isoformat()
+            now_t = datetime.now(TZ).strftime("%H:%M")
+            storage.add_diary_entry(chat_id, {"date": today, "time": now_t, "source": "logged", **pending})
+            storage.save_user(chat_id, {"pending_food": None, "ai_state": None})
+            edit(f"✅ Записал: *{pending['name']}* — {pending['kcal']} ккал "
+                 f"(Б {pending['protein']} Ж {pending['fat']} У {pending['carbs']})", ai_menu_keyboard())
+        elif sub == "RETRY":
+            storage.save_user(chat_id, {"pending_food": None, "ai_state": "food_log"})
+            edit("Хорошо, напиши ещё раз, что съел 🍽", back_to_ai_menu_keyboard())
+        else:
+            storage.save_user(chat_id, {"pending_food": None, "ai_state": None})
+            edit("Отменил.", ai_menu_keyboard())
+
+    elif action == "AIR":
+        handle_reminder_response(chat_id, message_id, parts[1], parts[2])
+
     tg("answerCallbackQuery", callback_query_id=cb["id"])
 
 
@@ -458,32 +921,97 @@ def delete_webhook():
     return jsonify(tg("deleteWebhook"))
 
 
-if __name__ == "__main__":
-    app.run(debug=True)
+def _reload_pythonanywhere_webapp() -> None:
+    """git pull только обновляет файлы на диске — воркер продолжает работать со старым
+    кодом, пока его явно не перезапустить. Без этого шага деплой выглядел законченным
+    (вебхук отвечал 200), а бот на самом деле продолжал работать на старой версии."""
+    pa_token = os.getenv("PA_API_TOKEN")
+    pa_user = os.getenv("PA_USERNAME")
+    pa_domain = os.getenv("PA_DOMAIN")
+    if not (pa_token and pa_user and pa_domain):
+        app.logger.warning("PA_API_TOKEN/PA_USERNAME/PA_DOMAIN не заданы — пропускаю reload")
+        return
+    try:
+        requests.post(
+            f"https://www.pythonanywhere.com/api/v0/user/{pa_user}/webapps/{pa_domain}/reload/",
+            headers={"Authorization": f"Token {pa_token}"}, timeout=30,
+        )
+    except requests.RequestException as e:
+        app.logger.error("PA reload error: %s", e)
 
-@app.route('/github-webhook', methods=['POST'])
+
+@app.route("/github-webhook", methods=["POST"])
 def github_webhook():
-    import hmac
     import hashlib
+    import hmac
     import subprocess
-    import os
 
-    secret = os.environ.get('GITHUB_SECRET', '').encode('utf-8')
-    signature = request.headers.get('X-Hub-Signature-256', '')
+    secret = (os.getenv("GITHUB_SECRET") or os.getenv("GITHUB_WEBHOOK_SECRET") or "").encode("utf-8")
+    signature = request.headers.get("X-Hub-Signature-256", "")
 
     if secret:
         payload = request.get_data()
-        expected = 'sha256=' + hmac.new(secret, payload, hashlib.sha256).hexdigest()
+        expected = "sha256=" + hmac.new(secret, payload, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
-            return 'Unauthorized', 401
+            return "Unauthorized", 401
 
+    repo_dir = os.getenv("DEPLOY_REPO_DIR", "/home/f6iznj3iP7/dietbot")
     try:
         result = subprocess.run(
-            ['git', '-C', '/home/f6iznj3iP7/dietbot', 'pull', 'origin', 'main'],
-            capture_output=True, text=True, timeout=30
+            ["git", "-C", repo_dir, "pull", "origin", "main"],
+            capture_output=True, text=True, timeout=30,
         )
-        print(f"Git pull: {result.stdout}")
+        app.logger.info("Git pull: %s %s", result.stdout, result.stderr)
     except Exception as e:
-        print(f"Git pull error: {e}")
+        app.logger.error("Git pull error: %s", e)
+        return "OK (pull failed)", 200
 
-    return 'OK', 200
+    _reload_pythonanywhere_webapp()
+    return "OK", 200
+
+
+def _time_due(scheduled: str, now_hm: str, window_minutes: int = 10) -> bool:
+    """Напоминание пора отправить, если текущее время попало в окно [scheduled, scheduled+window)."""
+    try:
+        sched_h, sched_m = (int(x) for x in scheduled.split(":"))
+        now_h, now_m = (int(x) for x in now_hm.split(":"))
+    except ValueError:
+        return False
+    return 0 <= (now_h * 60 + now_m) - (sched_h * 60 + sched_m) < window_minutes
+
+
+@app.route("/cron/tick")
+def cron_tick():
+    """
+    Дёргается внешним планировщиком раз в 5-10 минут (PythonAnywhere Tasks
+    не годится — там минимум раз в день; используй бесплатный cron-job.org).
+    Рассылает напоминания о приёмах пищи тем, у кого они включены.
+    """
+    if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
+        return jsonify(ok=False, error="forbidden"), 403
+
+    now = datetime.now(TZ)
+    today = now.date().isoformat()
+    now_hm = now.strftime("%H:%M")
+    sent = 0
+
+    for chat_id_str, user in storage.all_users().items():
+        if not user.get("reminders_enabled"):
+            continue
+        reminders = user.get("reminders") or {}
+        reminded_today = (user.get("reminded") or {}).get(today, [])
+        for slot, time_str in reminders.items():
+            if not time_str or slot in reminded_today or not _time_due(time_str, now_hm):
+                continue
+            label = MEAL_SLOT_LABELS.get(slot, slot)
+            tg("sendMessage", chat_id=int(chat_id_str),
+               text=f"⏰ Время приёма пищи: {label}\nПоел по плану?",
+               reply_markup=reminder_response_keyboard(slot))
+            storage.mark_reminded(int(chat_id_str), today, slot)
+            sent += 1
+
+    return jsonify(ok=True, sent=sent, checked_at=now_hm)
+
+
+if __name__ == "__main__":
+    app.run(debug=True)

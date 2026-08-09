@@ -71,3 +71,58 @@ def set_price_override(product_key: str, price: float) -> None:
     prices[product_key] = price
     data["_prices"] = prices
     _write_all(data)
+
+
+# --- ИИ-диетолог: анкета, дневник питания, напоминания ---
+
+def update_profile(chat_id: int, patch: dict) -> dict:
+    """Точечно обновляет вложенный словарь user['profile'] (не затирая остальные поля)."""
+    data = _read_all()
+    user = data.get(str(chat_id), {})
+    profile = dict(user.get("profile", {}))
+    profile.update(patch)
+    user["profile"] = profile
+    data[str(chat_id)] = user
+    _write_all(data)
+    return user
+
+
+def add_diary_entry(chat_id: int, entry: dict) -> dict:
+    """Добавляет запись в дневник питания. Хранит не больше последних 500 записей."""
+    data = _read_all()
+    user = data.get(str(chat_id), {})
+    diary = list(user.get("diary", []))
+    diary.append(entry)
+    if len(diary) > 500:
+        diary = diary[-500:]
+    user["diary"] = diary
+    data[str(chat_id)] = user
+    _write_all(data)
+    return user
+
+
+def get_diary(chat_id: int) -> list:
+    return _read_all().get(str(chat_id), {}).get("diary", [])
+
+
+def mark_reminded(chat_id: int, date_str: str, slot: str) -> None:
+    """Отмечает, что напоминание на этот слот в эту дату уже отправлено (без дублей)."""
+    data = _read_all()
+    user = data.get(str(chat_id), {})
+    reminded = dict(user.get("reminded", {}))
+    day_list = list(reminded.get(date_str, []))
+    if slot not in day_list:
+        day_list.append(slot)
+    reminded[date_str] = day_list
+    if len(reminded) > 3:
+        for key in sorted(reminded)[:-3]:
+            reminded.pop(key, None)
+    user["reminded"] = reminded
+    data[str(chat_id)] = user
+    _write_all(data)
+
+
+def all_users() -> dict:
+    """Все пользователи бота (для рассылки напоминаний по крону), без служебных ключей."""
+    data = _read_all()
+    return {k: v for k, v in data.items() if k != "_prices" and k.isdigit()}
