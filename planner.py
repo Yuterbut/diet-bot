@@ -299,7 +299,12 @@ def format_recipe(name: str) -> str:
         return "Для этого блюда рецепт не нужен — всё готовится за пару минут."
 
     recipe = meal["recipe"]
-    lines = [f"👨‍🍳 *{name}*", f"⏱ Время: около {recipe['time']} мин", "", "*Понадобится на порцию:*"]
+    lines = [f"👨‍🍳 *{name}*", f"⏱ Время: около {recipe['time']} мин"]
+    if "kcal" in meal:
+        lines.append(f"🔥 {meal['kcal']} ккал · Б {meal.get('protein', 0)} "
+                      f"Ж {meal.get('fat', 0)} У {meal.get('carbs', 0)}")
+    lines.append("")
+    lines.append("*Понадобится на порцию:*")
     for key, amount in meal["ingredients"].items():
         lines.append(f"• {PRODUCTS[key]['name']} — {format_amount(key, amount)}")
     lines.append("")
@@ -307,6 +312,18 @@ def format_recipe(name: str) -> str:
     for i, step in enumerate(recipe["steps"], start=1):
         lines.append(f"{i}. {step}")
     return "\n".join(lines)
+
+
+def day_macros(plan_names: list, day: int) -> dict:
+    """Суммарное КБЖУ за день (0, если у блюд нет данных о питательности)."""
+    totals = {"kcal": 0, "protein": 0, "fat": 0, "carbs": 0}
+    for name in plan_names[day]:
+        meal = meal_by_name(name)
+        if not meal:
+            continue
+        for key in totals:
+            totals[key] += meal.get(key, 0)
+    return totals
 
 
 def format_day(plan_names: list, day: int, meals_per_day: int) -> str:
@@ -318,5 +335,12 @@ def format_day(plan_names: list, day: int, meals_per_day: int) -> str:
     for meal_type, name in zip(order, plan_names[day]):
         meal = meal_by_name(name)
         mark = " 👨‍🍳" if meal and "recipe" in meal else ""
-        lines.append(f"{MEAL_TYPE_LABELS[meal_type]}: {name}{mark}")
+        kcal_part = f" ({meal['kcal']} ккал)" if meal and "kcal" in meal else ""
+        lines.append(f"{MEAL_TYPE_LABELS[meal_type]}: {name}{kcal_part}{mark}")
+
+    macros = day_macros(plan_names, day)
+    if macros["kcal"]:
+        lines.append("")
+        lines.append(f"🔥 *{macros['kcal']} ккал за день* · Б {macros['protein']} "
+                      f"Ж {macros['fat']} У {macros['carbs']}")
     return "\n".join(lines)
