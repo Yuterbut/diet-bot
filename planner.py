@@ -15,9 +15,16 @@ MEAL_ORDER_3 = ["breakfast", "lunch", "dinner"]
 MEAL_ORDER_5 = ["breakfast", "snack", "lunch", "snack", "dinner"]
 
 
-def _pack_price(product_key: str, region: str) -> float:
-    """Цена упаковки: сначала смотрим ручные правки, потом справочник."""
-    override = get_price_overrides().get(product_key)
+def _pack_price(product_key: str, region: str, overrides: dict) -> float:
+    """Цена упаковки: сначала смотрим ручные правки, потом справочник.
+
+    overrides передаётся вызывающим кодом, а не читается здесь заново —
+    раньше get_price_overrides() (чтение data.json с диска) вызывался на
+    каждый ингредиент каждого блюда-кандидата, это тысячи чтений файла
+    за один generate_plan(). С расширением базы блюд это стало заметно
+    (на PythonAnywhere сетевой диск даёт задержку на порядок выше, чем
+    локальный SSD)."""
+    override = overrides.get(product_key)
     if override is not None:
         return float(override)
     return pack_price(product_key, region)
@@ -39,7 +46,7 @@ def candidates(meal_type: str, goal: str, restrictions: set) -> list:
     return loose or pool
 
 
-def build_shopping_list(plan: list, region: str) -> tuple[list, float, float]:
+def build_shopping_list(plan: list, region: str, overrides: dict | None = None) -> tuple[list, float, float]:
     """
     Считает, сколько всего продуктов нужно на весь план.
     Возвращает (список позиций, стоимость покупки, стоимость съеденного).
@@ -47,7 +54,13 @@ def build_shopping_list(plan: list, region: str) -> tuple[list, float, float]:
     Стоимость покупки — по целым упаковкам, это реальный чек в магазине.
     Стоимость съеденного — по факту расхода: остаток упаковки (например,
     банка мёда, из которой ушло 20 г) переходит на следующие недели.
+
+    overrides можно передать заранее (см. _pack_price) — если не передан,
+    читается один раз здесь же, а не на каждый ингредиент.
     """
+    if overrides is None:
+        overrides = get_price_overrides()
+
     totals: dict[str, float] = {}
     for day in plan:
         for meal in day:
@@ -59,9 +72,10 @@ def build_shopping_list(plan: list, region: str) -> tuple[list, float, float]:
     consumed_total = 0.0
     for key, amount in totals.items():
         product = PRODUCTS[key]
-        unit_price = _pack_price(key, region) / product["pack"]
+        price = _pack_price(key, region, overrides)
+        unit_price = price / product["pack"]
         packs = math.ceil(amount / product["pack"])
-        cost = packs * _pack_price(key, region)
+        cost = packs * price
         grand_total += cost
         consumed_total += amount * unit_price
         items.append({
@@ -76,7 +90,7 @@ def build_shopping_list(plan: list, region: str) -> tuple[list, float, float]:
     return items, round(grand_total), round(consumed_total)
 
 
-def _marginal_cost(totals: dict, meal: dict, region: str) -> float:
+def _marginal_cost(totals: dict, meal: dict, region: str, overrides: dict) -> float:
     """
     Сколько ДОБАВИТСЯ к чеку, если включить это блюдо.
     Если продукт уже куплен и остатка в упаковке хватает — добавка нулевая.
@@ -88,7 +102,7 @@ def _marginal_cost(totals: dict, meal: dict, region: str) -> float:
         was = totals.get(key, 0)
         packs_before = math.ceil(was / product["pack"]) if was else 0
         packs_after = math.ceil((was + amount) / product["pack"])
-        extra += (packs_after - packs_before) * _pack_price(key, region)
+        extra += (packs_after - packs_before) * _pack_price(key, region, overrides)
     return extra
 
 
@@ -104,7 +118,7 @@ MIN_GAP_DEFAULT = 2
 
 
 def _pick(pool: list, counts: dict, last_day: dict, day: int, day_names: list,
-          totals: dict, cheap_level: int, region: str, meal_type: str):
+          totals: dict, cheap_level: int, region: str, meal_type: str, overrides: dict):
     """
     Выбирает блюдо с учётом правил разнообразия.
     Ограничения снимаются по очереди, только если иначе выбрать не из чего:
@@ -132,14 +146,14 @@ def _pick(pool: list, counts: dict, last_day: dict, day: int, day_names: list,
     options = allowed(strict=True) or allowed(strict=False) or pool
 
     if cheap_level >= 1:
-        ranked = sorted(options, key=lambda m: _marginal_cost(totals, m, region))
+        ranked = sorted(options, key=lambda m: _marginal_cost(totals, m, region, overrides))
         top = 1 if cheap_level >= 2 else 3
         return random.choice(ranked[:top])
     return random.choice(options)
 
 
 def _generate_once(goal: str, restrictions: set, meals_per_day: int,
-                   cheap_level: int, region: str) -> list:
+                   cheap_level: int, region: str, overrides: dict) -> list:
     """
     cheap_level: 0 — свободный подбор, 1 — умеренная экономия, 2 — жёсткая.
     Правила разнообразия действуют на всех уровнях: даже в самом экономном
@@ -158,7 +172,7 @@ def _generate_once(goal: str, restrictions: set, meals_per_day: int,
         for meal_type in order:
             pool = candidates(meal_type, goal, restrictions)
             meal = _pick(pool, counts[meal_type], last_day[meal_type], day_index,
-                         day_names, totals, cheap_level, region, meal_type)
+                         day_names, totals, cheap_level, region, meal_type, overrides)
             name = meal["name"]
 
             counts[meal_type][name] = counts[meal_type].get(name, 0) + 1
@@ -180,6 +194,7 @@ def generate_plan(goal: str, restrictions: set, meals_per_day: int,
     Возвращает словарь с планом, списком покупок и стоимостью.
     """
     best = None
+    overrides = get_price_overrides()  # один раз на весь подбор, а не на каждый ингредиент
 
     for attempt in range(40):
         if budget is None:
@@ -191,8 +206,8 @@ def generate_plan(goal: str, restrictions: set, meals_per_day: int,
         else:
             cheap_level = 2
 
-        plan = _generate_once(goal, restrictions, meals_per_day, cheap_level, region)
-        items, total, consumed = build_shopping_list(plan, region)
+        plan = _generate_once(goal, restrictions, meals_per_day, cheap_level, region, overrides)
+        items, total, consumed = build_shopping_list(plan, region, overrides)
 
         if best is None or total < best["total"]:
             best = {"plan": plan, "items": items, "total": total, "consumed": consumed}
