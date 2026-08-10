@@ -13,6 +13,7 @@ from unittest import mock
 
 import pytest
 
+import ai_agent
 import planner
 from meals_data import MEALS
 from products import PRODUCTS, pack_price
@@ -425,3 +426,366 @@ def test_meal_allowed_accepts_everything_without_preferences():
     for meal_type in MEALS:
         for meal in MEALS[meal_type]:
             assert planner.meal_allowed(meal, None, None) is True, meal["name"]
+
+
+# ---------- Блюда не из базы: custom ----------
+
+AI_NAME = "Гречка с огурцом (от ИИ)"
+AI_INGREDIENTS = {"buckwheat": 70, "cucumber": 80, "eggs": 1}
+# теги, которые nutrition_data.compute_tags выдаёт блюду без мяса, глютена и прочего
+AI_TAGS = ["vegetarian", "gluten_free", "lactose_free", "no_nuts",
+           "no_seafood", "no_pork", "no_beef"]
+
+
+def _ai_meal(name: str, **extra) -> dict:
+    """Блюдо ровно того вида, что возвращает ai_agent.generate_meal."""
+    return {
+        "name": name,
+        "goals": ["loss", "gain", "maintain", "variety"],
+        "tags": list(AI_TAGS),
+        "cuisine": "international",
+        "difficulty": "easy",
+        "time": 12,
+        "ingredients": dict(AI_INGREDIENTS),
+        "kcal": 320, "protein": 14, "fat": 9, "carbs": 44,
+        "recipe": {"time": 12, "steps": ["Отварить гречку", "Смешать с огурцом"]},
+        **extra,
+    }
+
+
+def _rebuild(plan_names: list, custom=None):
+    with mock.patch.object(planner, "get_price_overrides", return_value={}):
+        return planner.rebuild_totals(plan_names, REGION, custom)
+
+
+@pytest.fixture
+def custom():
+    return {AI_NAME: _ai_meal(AI_NAME)}
+
+
+def test_meal_by_name_finds_a_dish_from_custom(custom):
+    assert planner.meal_by_name(AI_NAME, custom)["kcal"] == 320
+
+
+def test_meal_by_name_prefers_the_database_over_custom():
+    """Совпали названия — блюдо берём из базы: подменять её тем, что пришло
+    из хранилища плана, нельзя."""
+    known = MEALS["lunch"][0]
+
+    assert planner.meal_by_name(known["name"], {known["name"]: _ai_meal(known["name"])}) is known
+
+
+@pytest.mark.parametrize("broken", [
+    None,
+    {},
+    "не словарь",
+    {AI_NAME: None},
+    {AI_NAME: {"name": AI_NAME}},                                   # без состава
+    {AI_NAME: _ai_meal(AI_NAME, ingredients={})},
+    {AI_NAME: _ai_meal(AI_NAME, ingredients={"дракон": 100})},      # нет такого продукта
+    {AI_NAME: _ai_meal(AI_NAME, ingredients={"buckwheat": -70})},
+])
+def test_meal_by_name_ignores_broken_custom(broken):
+    """custom лежит в JSON на диске: он мог пережить смену версии или правку
+    руками, но уронить показ плана из-за этого нельзя."""
+    assert planner.meal_by_name(AI_NAME, broken) is None
+
+
+def test_meals_from_names_resolves_dishes_from_custom(custom):
+    known = MEALS["breakfast"][0]["name"]
+    result = planner.meals_from_names([[known, AI_NAME, "такого блюда нет"]], custom)
+
+    assert [m["name"] for m in result[0]] == [known, AI_NAME]
+
+
+def test_rebuild_totals_counts_a_dish_from_custom(custom):
+    names = [[MEALS["breakfast"][0]["name"], AI_NAME]]
+
+    _, _, with_custom = _rebuild(names, custom)
+    _, _, without = _rebuild(names)
+
+    assert with_custom > without
+
+
+def test_recipe_meals_for_day_includes_a_dish_from_custom(custom):
+    names = [[MEALS["breakfast"][0]["name"], AI_NAME]]
+
+    assert AI_NAME in planner.recipe_meals_for_day(names, 0, custom)
+
+
+def test_format_recipe_shows_a_dish_from_custom(custom):
+    text = planner.format_recipe(AI_NAME, custom)
+
+    assert AI_NAME in text
+    assert "Отварить гречку" in text
+    assert PRODUCTS["buckwheat"]["name"] in text
+
+
+def test_format_recipe_without_custom_does_not_find_a_generated_dish():
+    assert "Отварить гречку" not in planner.format_recipe(AI_NAME)
+
+
+def test_format_recipe_survives_a_dish_without_steps():
+    broken = {AI_NAME: _ai_meal(AI_NAME, recipe={})}
+
+    assert AI_NAME in planner.format_recipe(AI_NAME, broken)
+
+
+def test_day_macros_counts_a_dish_from_custom(custom):
+    known = MEALS["breakfast"][0]
+    names = [[known["name"], AI_NAME]]
+
+    assert planner.day_macros(names, 0, custom)["kcal"] == known["kcal"] + 320
+
+
+def test_day_macros_without_custom_would_lose_a_generated_dish():
+    """Ровно та ошибка, ради которой custom и передаётся: без него придуманное
+    блюдо молча считается нулём калорий."""
+    assert planner.day_macros([[AI_NAME]], 0)["kcal"] == 0
+
+
+def test_format_day_shows_a_dish_from_custom(custom):
+    names = [[MEALS["breakfast"][0]["name"], MEALS["lunch"][0]["name"], AI_NAME]]
+
+    text = planner.format_day(names, 0, 3, custom)
+
+    assert f"{AI_NAME} (320 ккал)" in text
+
+
+def test_swap_options_offers_a_dish_from_custom(plan3, custom):
+    """Придуманное блюдо стоит в плане — значит, и в заменах оно должно быть:
+    ради пустого пула его и генерировали."""
+    names = _names(plan3["plan"])
+    names[1][2] = AI_NAME
+
+    options = planner.swap_options(names, 0, 2, 3, "variety", set(), limit=99, custom=custom)
+
+    assert AI_NAME in options
+
+
+def test_swap_options_without_custom_ignores_a_generated_dish(plan3):
+    names = _names(plan3["plan"])
+    names[1][2] = AI_NAME
+
+    assert AI_NAME not in planner.swap_options(names, 0, 2, 3, "variety", set(), limit=99)
+
+
+@pytest.mark.parametrize("func_name", [
+    "meal_by_name", "meals_from_names", "rebuild_totals", "recipe_meals_for_day",
+    "format_recipe", "day_macros", "format_day", "swap_options",
+])
+def test_custom_is_an_optional_last_argument(func_name):
+    """Бот вызывает эти функции и без custom (планы, собранные до появления
+    придуманных блюд), поэтому параметр обязан быть необязательным."""
+    param = inspect.signature(getattr(planner, func_name)).parameters["custom"]
+
+    assert param.default is None
+
+
+# ---------- Догенерация блюд: ai_fill ----------
+
+# Узкий профиль: то же, что выбрал тестировщик — с cooking_level="simple"
+# ужинов в базе остаётся два, и неделя превращается в два блюда через день.
+NARROW_CATS = {"крупы", "молочное", "яйца", "фрукты", "овощи", "птица", "хлеб"}
+ALL_CATS = {product["category"] for product in PRODUCTS.values()}
+
+
+def _pool_size(meal_type: str, goal: str = "variety", restrictions=frozenset(),
+               cooking_level: str = "simple", categories=NARROW_CATS) -> int:
+    return sum(1 for m in MEALS[meal_type]
+               if planner.fits(m, goal, set(restrictions))
+               and planner.meal_allowed(m, cooking_level, categories))
+
+
+def _ai_stub(fake=None) -> mock.Mock:
+    """Подмена ai_agent.generate_meal: считает вызовы и не ходит в сеть.
+    По умолчанию каждый раз отдаёт новое блюдо."""
+    def default(meal_type, keys, cooking_level=None, goal=None):
+        return _ai_meal(f"ИИ-блюдо {stub.call_count} ({meal_type})")
+
+    stub = mock.Mock(side_effect=fake or default)
+    return stub
+
+
+def _ai_plan(stub, meals_per_day: int = 3, **extra) -> dict:
+    with mock.patch.object(ai_agent, "generate_meal", stub):
+        return _make_plan(meals_per_day, cooking_level="simple",
+                          allowed_categories=NARROW_CATS, ai_fill=True, **extra)
+
+
+def test_generate_plan_always_returns_custom_meals(plan3):
+    assert plan3["custom_meals"] == {}
+
+
+def test_ai_is_not_called_without_ai_fill():
+    stub = _ai_stub()
+    with mock.patch.object(ai_agent, "generate_meal", stub):
+        result = _make_plan(3, cooking_level="simple", allowed_categories=NARROW_CATS)
+
+    assert stub.call_count == 0
+    assert result["custom_meals"] == {}
+
+
+def test_ai_is_not_called_when_the_pools_are_big_enough():
+    stub = _ai_stub()
+    with mock.patch.object(ai_agent, "generate_meal", stub):
+        result = _make_plan(3, allowed_categories=ALL_CATS, ai_fill=True)
+
+    assert stub.call_count == 0
+    assert result["custom_meals"] == {}
+
+
+def test_ai_is_not_called_without_a_product_filter():
+    """allowed_categories=None — продукты не ограничены, база доступна целиком,
+    придумывать нечего."""
+    stub = _ai_stub()
+    with mock.patch.object(ai_agent, "generate_meal", stub):
+        result = _make_plan(3, cooking_level="simple", ai_fill=True)
+
+    assert stub.call_count == 0
+    assert result["custom_meals"] == {}
+
+
+def test_ai_fill_breaks_up_a_starving_meal_type():
+    assert _pool_size("dinner") < planner.AI_MIN_POOL  # предпосылка теста
+
+    result = _ai_plan(_ai_stub())
+    dinners = {day[2] for day in _names(result["plan"])}
+
+    assert len(dinners) > _pool_size("dinner")
+    assert dinners & set(result["custom_meals"])
+
+
+def test_every_dish_of_a_topped_up_plan_resolves_back_from_its_name():
+    """То, ради чего custom_meals вообще возвращается: план хранится
+    названиями, и по названию должно найтись каждое блюдо."""
+    result = _ai_plan(_ai_stub())
+    names = _names(result["plan"])
+
+    for day in names:
+        for name in day:
+            assert planner.meal_by_name(name, result["custom_meals"]), name
+
+
+def test_custom_meals_holds_only_dishes_that_got_into_the_plan():
+    result = _ai_plan(_ai_stub())
+    names = {n for day in _names(result["plan"]) for n in day}
+
+    assert set(result["custom_meals"]) <= names
+
+
+def test_ai_fill_respects_the_call_cap():
+    stub = _ai_stub()
+    _ai_plan(stub)
+
+    assert stub.call_count == planner.AI_MAX_CALLS
+    assert planner.AI_MAX_CALLS <= 4  # каждый запрос — секунды ожидания в вебхуке
+
+
+def test_ai_is_asked_once_and_not_on_every_attempt():
+    """generate_plan перебирает до 40 вариантов подбора. Спрашивать ИИ внутри
+    цикла — это десятки запросов на один план."""
+    stub = _ai_stub()
+    result = _ai_plan(stub, budget=1)  # в такой бюджет не уложиться: все 40 попыток
+
+    assert result["over_budget"] is True
+    assert stub.call_count == planner.AI_MAX_CALLS
+
+
+def test_ai_calls_go_to_the_thinnest_meal_types():
+    stub = _ai_stub()
+    _ai_plan(stub, meals_per_day=5)
+    asked = [call.args[0] for call in stub.call_args_list]
+
+    assert set(asked) == {"dinner", "lunch"}  # завтраков и перекусов хватает своих
+    assert asked.count("dinner") >= asked.count("lunch")  # ужинов меньше всего
+
+
+def test_plan_is_complete_when_the_ai_is_down():
+    result = _ai_plan(_ai_stub(lambda *args, **kwargs: None))
+
+    assert [len(day) for day in result["plan"]] == [3] * 7
+    assert result["custom_meals"] == {}
+    assert result["total"] > 0
+
+
+def test_an_unavailable_ai_gives_exactly_the_plan_without_ai_fill():
+    """Недоступный ИИ ничего не меняет — ни блюд, ни цены."""
+    down = _ai_plan(_ai_stub(lambda *args, **kwargs: None))
+    plain = _make_plan(3, cooking_level="simple", allowed_categories=NARROW_CATS)
+
+    assert _names(down["plan"]) == _names(plain["plan"])
+    assert down["total"] == plain["total"]
+
+
+def test_an_unavailable_ai_costs_one_call_not_four():
+    """Первый None — это чаще всего мёртвый провайдер, а поход к нему стоит
+    до 25 секунд на каждого из трёх по очереди. Второй раз ждать нельзя."""
+    stub = _ai_stub(lambda *args, **kwargs: None)
+    _ai_plan(stub)
+
+    assert stub.call_count == 1
+
+
+def test_a_generated_dish_breaking_a_restriction_is_dropped():
+    """generate_meal про ограничения не знает — теги проверяет планировщик.
+
+    Ограничение здесь такое, которого нет ни у одного блюда базы (завтра бот
+    добавит галочку, а блюда ещё не размечены): только на нём и виден смысл
+    проверки. На последней уступке candidates разрешает вообще всё — но
+    добавлять к этому ещё и блюдо, про которое мы точно знаем, что оно не
+    подходит, нельзя. Дешёвый состав и недостижимый бюджет нужны, чтобы блюдо
+    выбиралось не случайно: на cheap_level=2 берётся самое дешёвое."""
+    def cheap_and_forbidden(*args, **kwargs):
+        return _ai_meal("ИИ-блюдо без нужного тега", tags=["gluten_free"],
+                        ingredients={"oats": 5})
+
+    result = _ai_plan(_ai_stub(cheap_and_forbidden), restrictions={"halal"}, budget=1)
+
+    assert result["custom_meals"] == {}
+    assert "ИИ-блюдо без нужного тега" not in {n for day in _names(result["plan"]) for n in day}
+
+
+def test_generated_dishes_with_the_same_name_are_registered_once():
+    def always_the_same(*args, **kwargs):
+        return _ai_meal("ИИ-блюдо на все случаи")
+
+    result = _ai_plan(_ai_stub(always_the_same))
+
+    assert list(result["custom_meals"]) == ["ИИ-блюдо на все случаи"]
+
+
+def test_a_generated_dish_named_like_a_database_dish_is_dropped():
+    """Имя — единственный ключ, по которому блюдо потом ищут: двух разных
+    блюд с одним именем в плане быть не должно."""
+    def clone(*args, **kwargs):
+        return _ai_meal(MEALS["dinner"][0]["name"])
+
+    result = _ai_plan(_ai_stub(clone))
+
+    assert result["custom_meals"] == {}
+
+
+def test_a_generated_dish_with_an_unknown_product_is_dropped():
+    """Состав от ИИ — настоящие ключи PRODUCTS, но если однажды будет иначе,
+    план не должен развалиться на подсчёте покупок."""
+    def dragon(*args, **kwargs):
+        return _ai_meal("ИИ-блюдо из дракона", ingredients={"дракон": 100})
+
+    result = _ai_plan(_ai_stub(dragon))
+
+    assert result["custom_meals"] == {}
+    assert [len(day) for day in result["plan"]] == [3] * 7
+
+
+def test_a_generated_dish_is_paid_for_in_the_shopping_list():
+    """Придуманные блюда участвуют в деньгах наравне с обычными, а список
+    покупок собирается заново из названий — числа обязаны совпасть."""
+    result = _ai_plan(_ai_stub())
+    names = _names(result["plan"])
+    items, total, consumed = _rebuild(names, result["custom_meals"])
+    _, _, without = _rebuild(names)  # как если бы придуманные блюда потерялись
+
+    assert (items, total, consumed) == (result["items"], result["total"], result["consumed"])
+    assert consumed > without
+    assert set(AI_INGREDIENTS) <= {item["key"] for item in items}
