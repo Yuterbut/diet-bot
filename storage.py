@@ -10,9 +10,40 @@
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # не Linux (например, разработка под Windows) — работаем без блокировки
+    fcntl = None
+
 DATA_FILE = Path(__file__).parent / "data.json"
+
+
+@contextmanager
+def _locked():
+    """Эксклюзивная блокировка на время «прочитать — изменить — записать».
+
+    Без неё параллельные обновления теряются: воркер обрабатывает сообщение
+    пользователя, крон в это же время пишет отметку о напоминании, оба
+    прочитали файл до правок друг друга — и чьи-то данные затираются целиком.
+    На PythonAnywhere воркеров несколько, так что гонка не теоретическая:
+    в тесте пять параллельных писателей теряли двух пользователей из пяти.
+
+    Путь берём в момент вызова, а не при импорте — тесты подменяют DATA_FILE.
+    """
+    if fcntl is None:
+        yield
+        return
+    lock_path = DATA_FILE.with_name(DATA_FILE.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _read_all() -> dict:
@@ -45,18 +76,20 @@ def get_user(chat_id: int) -> dict:
 
 def save_user(chat_id: int, patch: dict) -> dict:
     """Обновляет данные пользователя, возвращает результат."""
-    data = _read_all()
-    user = data.get(str(chat_id), {})
-    user.update(patch)
-    data[str(chat_id)] = user
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        user = data.get(str(chat_id), {})
+        user.update(patch)
+        data[str(chat_id)] = user
+        _write_all(data)
     return user
 
 
 def clear_user(chat_id: int) -> None:
-    data = _read_all()
-    data.pop(str(chat_id), None)
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        data.pop(str(chat_id), None)
+        _write_all(data)
 
 
 # --- Пользовательские правки цен (команда /цена) ---
@@ -66,38 +99,41 @@ def get_price_overrides() -> dict:
 
 
 def set_price_override(product_key: str, price: float) -> None:
-    data = _read_all()
-    prices = data.get("_prices", {})
-    prices[product_key] = price
-    data["_prices"] = prices
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        prices = data.get("_prices", {})
+        prices[product_key] = price
+        data["_prices"] = prices
+        _write_all(data)
 
 
 # --- ИИ-диетолог: анкета, дневник питания, напоминания ---
 
 def update_profile(chat_id: int, patch: dict) -> dict:
     """Точечно обновляет вложенный словарь user['profile'] (не затирая остальные поля)."""
-    data = _read_all()
-    user = data.get(str(chat_id), {})
-    profile = dict(user.get("profile", {}))
-    profile.update(patch)
-    user["profile"] = profile
-    data[str(chat_id)] = user
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        user = data.get(str(chat_id), {})
+        profile = dict(user.get("profile", {}))
+        profile.update(patch)
+        user["profile"] = profile
+        data[str(chat_id)] = user
+        _write_all(data)
     return user
 
 
 def add_diary_entry(chat_id: int, entry: dict) -> dict:
     """Добавляет запись в дневник питания. Хранит не больше последних 500 записей."""
-    data = _read_all()
-    user = data.get(str(chat_id), {})
-    diary = list(user.get("diary", []))
-    diary.append(entry)
-    if len(diary) > 500:
-        diary = diary[-500:]
-    user["diary"] = diary
-    data[str(chat_id)] = user
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        user = data.get(str(chat_id), {})
+        diary = list(user.get("diary", []))
+        diary.append(entry)
+        if len(diary) > 500:
+            diary = diary[-500:]
+        user["diary"] = diary
+        data[str(chat_id)] = user
+        _write_all(data)
     return user
 
 
@@ -107,19 +143,20 @@ def get_diary(chat_id: int) -> list:
 
 def mark_reminded(chat_id: int, date_str: str, slot: str) -> None:
     """Отмечает, что напоминание на этот слот в эту дату уже отправлено (без дублей)."""
-    data = _read_all()
-    user = data.get(str(chat_id), {})
-    reminded = dict(user.get("reminded", {}))
-    day_list = list(reminded.get(date_str, []))
-    if slot not in day_list:
-        day_list.append(slot)
-    reminded[date_str] = day_list
-    if len(reminded) > 3:
-        for key in sorted(reminded)[:-3]:
-            reminded.pop(key, None)
-    user["reminded"] = reminded
-    data[str(chat_id)] = user
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        user = data.get(str(chat_id), {})
+        reminded = dict(user.get("reminded", {}))
+        day_list = list(reminded.get(date_str, []))
+        if slot not in day_list:
+            day_list.append(slot)
+        reminded[date_str] = day_list
+        if len(reminded) > 3:
+            for key in sorted(reminded)[:-3]:
+                reminded.pop(key, None)
+        user["reminded"] = reminded
+        data[str(chat_id)] = user
+        _write_all(data)
 
 
 def all_users() -> dict:
@@ -131,17 +168,18 @@ def all_users() -> dict:
 def update_checkin(chat_id: int, date_str: str, slot: str, patch: dict) -> None:
     """Состояние опроса о приёме пищи: {"sent": "HH:MM", "followup_sent": bool, "responded": bool}.
     Хранит только последние 3 даты, чтобы файл не рос бесконечно."""
-    data = _read_all()
-    user = data.get(str(chat_id), {})
-    checkins = dict(user.get("checkins", {}))
-    day = dict(checkins.get(date_str, {}))
-    slot_state = dict(day.get(slot, {}))
-    slot_state.update(patch)
-    day[slot] = slot_state
-    checkins[date_str] = day
-    if len(checkins) > 3:
-        for key in sorted(checkins)[:-3]:
-            checkins.pop(key, None)
-    user["checkins"] = checkins
-    data[str(chat_id)] = user
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        user = data.get(str(chat_id), {})
+        checkins = dict(user.get("checkins", {}))
+        day = dict(checkins.get(date_str, {}))
+        slot_state = dict(day.get(slot, {}))
+        slot_state.update(patch)
+        day[slot] = slot_state
+        checkins[date_str] = day
+        if len(checkins) > 3:
+            for key in sorted(checkins)[:-3]:
+                checkins.pop(key, None)
+        user["checkins"] = checkins
+        data[str(chat_id)] = user
+        _write_all(data)

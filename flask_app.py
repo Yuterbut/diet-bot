@@ -28,7 +28,7 @@ import nutrition
 import photos
 import planner
 import storage
-from meals_data import BUDGET_PRESETS, GOAL_LABELS, MEAL_TYPE_LABELS, RESTRICTION_LABELS
+from meals_data import BUDGET_PRESETS, GOAL_LABELS, MEALS, MEAL_TYPE_LABELS, RESTRICTION_LABELS
 from products import PRODUCTS, REGIONS
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -55,10 +55,48 @@ app = Flask(__name__)
 RESTRICTION_KEYS = list(RESTRICTION_LABELS.keys())
 WELCOME = "Привет! 👋 Составлю план питания на неделю с учётом бюджета.\n\nКакая у тебя цель?"
 
+BUDGET_PROMPT = ("Какой бюджет на продукты на неделю?\n\n"
+                 "Выбери вариант или *напиши свою сумму числом* — например, 4500.")
+COOKING_PROMPT = ("Насколько ты готов возиться на кухне?\n\n"
+                  "_Уберу из плана то, что ты всё равно не станешь готовить._")
+
+# Значения совпадают с planner.COOKING_LEVELS; "any" = фильтр не применяется.
+COOKING_LABELS = {
+    "simple": "⚡️ Только простое, до 20 минут",
+    "normal": "🍳 Могу готовить, но без изысков",
+    "any": "👨‍🍳 Готовлю что угодно",
+}
+COOKING_SHORT = {"simple": "только простое", "normal": "без изысков", "any": "что угодно"}
+
+# Экран «что я ем»: 29 категорий из products.py — это неработающий экран в
+# телефоне, поэтому показываем 10 понятных групп, а планировщику отдаём уже
+# развёрнутые категории. Специи, масла и соусы в группы не входят намеренно:
+# planner.PANTRY_CATEGORIES считает их доступными всегда, галочка бы врала.
+PRODUCT_GROUPS = {
+    "grain": ("🌾 Крупы, макароны, хлеб", ["крупы", "макароны", "хлеб", "мука"]),
+    "meat": ("🍗 Мясо и птица", ["птица", "мясо"]),
+    "fish": ("🐟 Рыба и морепродукты", ["рыба", "морепродукты"]),
+    "dairy": ("🥛 Молочное и яйца", ["молочное", "яйца", "раст_молоко"]),
+    "veg": ("🥦 Овощи, зелень, грибы", ["овощи", "зелень", "грибы", "консервы"]),
+    "fruit": ("🍎 Фрукты и ягоды", ["фрукты", "ягоды", "сухофрукты"]),
+    "nuts": ("🥜 Орехи и семечки", ["орехи", "семена"]),
+    "beans": ("🫘 Бобовые, тофу", ["бобовые", "раст_белок"]),
+    "sweet": ("🍯 Сладкое: мёд, сахар, шоколад", ["сладости"]),
+    "drinks": ("☕️ Кофе, чай, протеин", ["напитки", "спортпит"]),
+}
+FEW_DISHES = 7  # блюд на приём пищи меньше, чем дней в неделе — начнутся повторы
+
 # ---------- ИИ-диетолог: константы ----------
 
 TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))
 CRON_SECRET = os.getenv("CRON_SECRET", "")
+
+# Публичный адрес бота. Берём из настроек, а НЕ из request.url_root: тот
+# строится по заголовку Host, который присылает клиент. Запрос с подставленным
+# Host переставил бы вебхук Telegram на чужой сервер — туда ушли бы сообщения
+# всех пользователей. PA_DOMAIN уже задан для перезагрузки веб-аппа.
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or
+              (f"https://{os.getenv('PA_DOMAIN')}" if os.getenv("PA_DOMAIN") else ""))
 
 SEX_LABELS = {"m": "Мужской", "f": "Женский"}
 MEAL_SLOT_LABELS = {"breakfast": "🌅 Завтрак", "lunch": "🥗 Обед", "dinner": "🍽 Ужин", "snack": "🍎 Перекус"}
@@ -142,6 +180,15 @@ def meals_keyboard():
     ]}
 
 
+def cooking_keyboard(back: str = ""):
+    """back — куда вернуться после выбора: "" (дальше по анкете) или "CAT" (экран продуктов)."""
+    suffix = f"|{back}" if back else ""
+    return {"inline_keyboard": [
+        [{"text": label, "callback_data": f"CL|{key}{suffix}"}]
+        for key, label in COOKING_LABELS.items()
+    ]}
+
+
 def region_keyboard():
     rows = [[{"text": data["name"], "callback_data": f"REG|{key}"}]
             for key, data in REGIONS.items()]
@@ -151,7 +198,50 @@ def region_keyboard():
 def budget_keyboard():
     rows = [[{"text": f"{p['name']} · {p['hint']}", "callback_data": f"B|{key}"}]
             for key, p in BUDGET_PRESETS.items()]
+    # необязательный шаг: по умолчанию разрешены все продукты, экран можно не открывать
+    rows.append([{"text": "🥗 Что я ем (необязательно)", "callback_data": "CAT|OPEN"}])
     return {"inline_keyboard": rows}
+
+
+def selected_groups(user: dict) -> list:
+    """Отмеченные группы продуктов. Ключа нет или None — разрешено всё."""
+    allowed = user.get("allowed_categories")
+    if allowed is None:
+        return list(PRODUCT_GROUPS)
+    allowed = set(allowed)
+    return [key for key, (_, cats) in PRODUCT_GROUPS.items() if set(cats) <= allowed]
+
+
+def categories_from_groups(groups: list) -> list | None:
+    """Список категорий (не set: storage пишет JSON) либо None, если отмечено всё —
+    тогда планировщик работает ровно как до появления этого экрана."""
+    if len(groups) == len(PRODUCT_GROUPS):
+        return None
+    cats: set[str] = set()
+    for key in groups:
+        cats.update(PRODUCT_GROUPS[key][1])
+    return sorted(cats)
+
+
+def categories_keyboard(user: dict):
+    selected = selected_groups(user)
+    rows = []
+    for key, (label, _) in PRODUCT_GROUPS.items():
+        box = "☑️" if key in selected else "⬜️"
+        rows.append([{"text": f"{box} {label}", "callback_data": f"CAT|T|{key}"}])
+    cooking = COOKING_SHORT.get(user.get("cooking_level") or "any", "что угодно")
+    rows.append([{"text": f"🍳 Готовка: {cooking}", "callback_data": "CL|OPEN"}])
+    done = "✅ Готово, пересобрать план" if user.get("plan_names") else "✅ Готово"
+    rows.append([{"text": "♻️ Разрешить всё", "callback_data": "CAT|ALL"},
+                 {"text": done, "callback_data": "CAT|DONE"}])
+    return {"inline_keyboard": rows}
+
+
+def restart_confirm_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🗑 Да, удалить и начать заново", "callback_data": "START|YES"}],
+        [{"text": "⬅️ Нет, вернуться", "callback_data": "HOME"}],
+    ]}
 
 
 def plan_keyboard(day: int = 0, total_days: int = 7):
@@ -163,11 +253,12 @@ def plan_keyboard(day: int = 0, total_days: int = 7):
             {"text": f"День {day + 1}/{total_days}", "callback_data": "NOOP"},
             {"text": "▶️", "callback_data": f"DAY|{next_day}"},
         ],
-        [{"text": "🔁 Заменить блюдо", "callback_data": f"SWAP|{day}"}],
+        [{"text": "🔁 Заменить блюдо", "callback_data": f"SWAP|{day}"},
+         {"text": "🥗 Что я ем", "callback_data": "CAT|OPEN"}],
         [{"text": "👨‍🍳 Рецепты", "callback_data": f"RECIPES|{day}"}],
         [{"text": "🛒 Список покупок", "callback_data": f"SHOP|{day}"}],
         [{"text": "🔄 Другой вариант", "callback_data": "REGEN"},
-         {"text": "⚙️ Заново", "callback_data": "START"}],
+         {"text": "⚙️ Заново", "callback_data": "START|ASK"}],
         [{"text": "🤖 ИИ-диетолог", "callback_data": "AI|START"}],
     ]}
 
@@ -329,10 +420,50 @@ def back_to_ai_menu_keyboard():
 
 # ---------- Формирование сообщений ----------
 
+def categories_text(user: dict) -> str:
+    """Экран «что я ем» со счётчиком блюд.
+
+    Счётчик — главное на экране: спорить, считать ли ложку мёда в каше
+    «сладостями», бессмысленно, а «завтраков 18 вместо 73» человек понимает
+    сразу и сам решает, снимать галочку или нет."""
+    cooking = user.get("cooking_level")
+    counts = {mt: sum(1 for m in meals if planner.meal_allowed(m, cooking, user.get("allowed_categories")))
+              for mt, meals in MEALS.items()}
+    order = set(planner.MEAL_ORDER_5 if user.get("meals_per_day") == 5 else planner.MEAL_ORDER_3)
+    types = [t for t in MEAL_TYPE_LABELS if t in order]
+
+    lines = ["🥗 *Что я ем*", ""]
+    lines.append("Отметь то, что покупаешь. Блюда из остального в план не попадут.")
+    lines.append("_Соль, масло, специи и соусы считаются доступными всегда._")
+    lines.append("")
+    lines.append(f"Подходит блюд: *{sum(counts[t] for t in types)} "
+                 f"из {sum(len(MEALS[t]) for t in types)}*")
+    for t in types:
+        lines.append(f"{MEAL_TYPE_LABELS[t]} — {counts[t]}")
+
+    scarce = [MEAL_TYPE_LABELS[t] for t in types if counts[t] < FEW_DISHES]
+    if not any(counts[t] for t in types):
+        lines.append("")
+        lines.append("⚠️ С таким набором не остаётся ни одного блюда — план соберётся "
+                     "без учёта продуктов. Отметь что-нибудь ещё.")
+    elif scarce:
+        lines.append("")
+        lines.append("⚠️ Совсем мало вариантов: " + ", ".join(scarce) +
+                     ". Неделя выйдет однообразной.")
+    return "\n".join(lines)
+
+
 def plan_text(user: dict, day: int = 0) -> str:
     header = [f"🎯 *{GOAL_LABELS[user['goal']]}* · 📍 {REGIONS[user['region']]['name']}"]
     if user.get("restrictions"):
         header.append("🚫 " + ", ".join(RESTRICTION_LABELS[r] for r in user["restrictions"]))
+    prefs = []
+    if user.get("cooking_level") in ("simple", "normal"):
+        prefs.append(f"🍳 {COOKING_SHORT[user['cooking_level']]}")
+    if user.get("allowed_categories") is not None:
+        prefs.append("🥗 только выбранные продукты")
+    if prefs:
+        header.append(" · ".join(prefs))
     header.append(f"💵 Чек в магазине: *≈ {user['total']} ₽*")
     if user.get("consumed") and user["consumed"] < user["total"] * 0.9:
         header.append(f"_Съедите примерно на {user['consumed']} ₽ — остальное "
@@ -341,7 +472,8 @@ def plan_text(user: dict, day: int = 0) -> str:
         header.append("\n⚠️ В заданный бюджет уложиться не удалось — это самый "
                       "дешёвый возможный вариант.")
     header.append("")
-    header.append(planner.format_day(user["plan_names"], day, user["meals_per_day"]))
+    header.append(planner.format_day(user["plan_names"], day, user["meals_per_day"],
+                                     custom=user.get("custom_meals")))
     header.append("")
     header.append("_👨‍🍳 — есть подробный рецепт_")
     return "\n".join(header)
@@ -378,17 +510,28 @@ def shopping_category_text(user: dict, category: str) -> str:
 
 
 def build_and_save(chat_id: int, user: dict) -> dict:
+    # придумывание блюд занимает несколько секунд — показываем, что бот занят
+    tg("sendChatAction", chat_id=chat_id, action="typing")
     result = planner.generate_plan(
         goal=user["goal"],
         restrictions=set(user.get("restrictions", [])),
         meals_per_day=user["meals_per_day"],
         budget=user.get("budget"),
         region=user.get("region", "center"),
+        # ключей может не быть у тех, кто собрал план до появления этих экранов —
+        # None означает «без фильтра», как и было раньше
+        cooking_level=user.get("cooking_level"),
+        allowed_categories=user.get("allowed_categories"),
+        ai_fill=True,
     )
     # сохраняем только названия блюд — их достаточно для показа плана
     plan_names = [[m["name"] for m in day] for day in result["plan"]]
     return storage.save_user(chat_id, {
         "plan_names": plan_names,
+        # придуманных блюд нет в статической базе, поэтому храним их рядом с планом.
+        # Каждый пересбор перезаписывает реестр целиком — иначе блюда старых планов
+        # копились бы в хранилище навсегда.
+        "custom_meals": result.get("custom_meals") or {},
         "items": result["items"],
         "total": result["total"],
         "consumed": result.get("consumed"),
@@ -894,11 +1037,6 @@ def handle_message(msg: dict) -> None:
     text = (msg.get("text") or "").strip()
     low = text.lower()
 
-    if low.startswith("/start"):
-        storage.clear_user(chat_id)
-        tg("sendMessage", chat_id=chat_id, text=WELCOME, reply_markup=goal_keyboard())
-        return
-
     if low.startswith(("/цена", "/price")):
         handle_price_command(chat_id, text)
         return
@@ -911,7 +1049,7 @@ def handle_message(msg: dict) -> None:
         ai_advance(chat_id)
         return
 
-    if low.startswith(("/menu", "/меню")):
+    if low.startswith(("/start", "/menu", "/меню")):
         user = storage.save_user(chat_id, {"ai_state": None})
         if user.get("plan_names"):
             tg("sendMessage", chat_id=chat_id, text=plan_text(user, 0),
@@ -959,8 +1097,7 @@ def handle_message(msg: dict) -> None:
 
     tg("sendMessage", chat_id=chat_id,
        text="Я работаю кнопками 🙂\n\n"
-            "/start — составить план питания заново\n"
-            "/menu — вернуться в меню (план или начало)\n"
+            "/start, /menu — вернуться в меню (план или начало)\n"
             "/ai — ИИ-диетолог (анкета, дневник КБЖУ, напоминания)\n"
             "/продукты — список продуктов и цен\n"
             "/цена — обновить цену продукта")
@@ -988,8 +1125,13 @@ def handle_callback(cb: dict) -> None:
            text=text, parse_mode="Markdown", reply_markup=keyboard)
 
     if action == "START":
-        storage.clear_user(chat_id)
-        edit(WELCOME, goal_keyboard())
+        # одно нажатие стирало план, дневник и анкету без единого вопроса
+        if len(parts) > 1 and parts[1] == "YES":
+            storage.clear_user(chat_id)
+            edit(WELCOME, goal_keyboard())
+        else:
+            edit("⚠️ *Начать заново*\n\nУдалю план, дневник питания, анкету и напоминания. "
+                 "Вернуть их будет нельзя.", restart_confirm_keyboard())
 
     elif action == "G":
         user = storage.save_user(chat_id, {"goal": parts[1], "restrictions": []})
@@ -1010,14 +1152,45 @@ def handle_callback(cb: dict) -> None:
 
     elif action == "M":
         storage.save_user(chat_id, {"meals_per_day": int(parts[1])})
-        edit("В каком регионе покупаешь продукты?\n"
-             "_Это влияет на расчёт стоимости._", region_keyboard())
+        edit(COOKING_PROMPT, cooking_keyboard())
+
+    elif action == "CL":
+        if parts[1] == "OPEN":
+            edit(COOKING_PROMPT, cooking_keyboard(back="CAT"))
+        else:
+            user = storage.save_user(chat_id, {"cooking_level": parts[1]})
+            if len(parts) > 2 and parts[2] == "CAT":
+                edit(categories_text(user), categories_keyboard(user))
+            else:
+                edit("В каком регионе покупаешь продукты?\n"
+                     "_Это влияет на расчёт стоимости._", region_keyboard())
+
+    elif action == "CAT":
+        sub = parts[1]
+        # проверка группы на всякий случай: кнопки живут в старых сообщениях,
+        # а набор групп со временем может измениться
+        if sub == "T" and len(parts) > 2 and parts[2] in PRODUCT_GROUPS:
+            groups = selected_groups(user)
+            key = parts[2]
+            groups.remove(key) if key in groups else groups.append(key)
+            user = storage.save_user(chat_id, {"allowed_categories": categories_from_groups(groups)})
+            edit(categories_text(user), categories_keyboard(user))
+        elif sub == "ALL":
+            user = storage.save_user(chat_id, {"allowed_categories": None})
+            edit(categories_text(user), categories_keyboard(user))
+        elif sub == "DONE":
+            # из анкеты возвращаемся к бюджету, из готового плана — пересобираем план
+            if user.get("plan_names"):
+                user = build_and_save(chat_id, user)
+                edit(plan_text(user, 0), plan_keyboard(0))
+            else:
+                edit(BUDGET_PROMPT, budget_keyboard())
+        else:  # OPEN и всё непонятное — просто показываем экран
+            edit(categories_text(user), categories_keyboard(user))
 
     elif action == "REG":
         storage.save_user(chat_id, {"region": parts[1], "awaiting_budget": True})
-        edit("Какой бюджет на продукты на неделю?\n\n"
-             "Выбери вариант или *напиши свою сумму числом* — например, 4500.",
-             budget_keyboard())
+        edit(BUDGET_PROMPT, budget_keyboard())
 
     elif action == "B":
         preset = BUDGET_PRESETS[parts[1]]
@@ -1051,7 +1224,10 @@ def handle_callback(cb: dict) -> None:
         day, slot = int(parts[1]), int(parts[2])
         options = planner.swap_options(
             user["plan_names"], day, slot, user["meals_per_day"],
-            user["goal"], set(user.get("restrictions", [])))
+            user["goal"], set(user.get("restrictions", [])),
+            cooking_level=user.get("cooking_level"),
+            allowed_categories=user.get("allowed_categories"),
+            custom=user.get("custom_meals"))
         storage.save_user(chat_id, {"swap_options": options})
         if options:
             current = user["plan_names"][day][slot]
@@ -1067,7 +1243,10 @@ def handle_callback(cb: dict) -> None:
         if choice < len(options):
             plan_names = [list(d) for d in user["plan_names"]]
             plan_names[day][slot] = options[choice]
-            items, total, consumed = planner.rebuild_totals(plan_names, user["region"])
+            items, total, consumed = planner.rebuild_totals(plan_names, user["region"],
+                                                            custom=user.get("custom_meals"))
+            # custom_meals не трогаем: заменённое блюдо могло остаться в другом дне,
+            # а лишняя запись безобидна — реестр перезапишется при пересборе плана
             user = storage.save_user(chat_id, {
                 "plan_names": plan_names, "items": items, "total": total,
                 "consumed": consumed, "bought": [],
@@ -1080,7 +1259,8 @@ def handle_callback(cb: dict) -> None:
     elif action == "RECIPES":
         day = int(parts[1]) if len(parts) > 1 else 0
         plan_names = user.get("plan_names", [])
-        names = planner.recipe_meals_for_day(plan_names, day) if plan_names else []
+        names = (planner.recipe_meals_for_day(plan_names, day, custom=user.get("custom_meals"))
+                 if plan_names else [])
         if names:
             storage.save_user(chat_id, {"recipe_names": names})
             edit(f"👨‍🍳 *Блюда дня {day + 1}, которые нужно готовить*\n\n"
@@ -1095,7 +1275,8 @@ def handle_callback(cb: dict) -> None:
         idx = int(parts[2])
         names = user.get("recipe_names", [])
         if idx < len(names):
-            edit(planner.format_recipe(names[idx]), recipe_back_keyboard(day))
+            edit(planner.format_recipe(names[idx], custom=user.get("custom_meals")),
+                 recipe_back_keyboard(day))
             photo_url = photos.search_dish_photo(names[idx])
             if photo_url:
                 resp = tg("sendPhoto", chat_id=chat_id, photo=photo_url, caption=names[idx])
@@ -1237,14 +1418,35 @@ def index():
     return jsonify(ok=True)
 
 
+def _admin_denied():
+    """Проверка секрета для служебных эндпоинтов. Отдельную переменную заводить
+    не стали: чем их больше, тем выше шанс забыть задать одну из них — а незаданный
+    секрет здесь означает, что любой желающий может выключить бота.
+
+    Возвращает готовый ответ при отказе либо None, если доступ разрешён."""
+    if not CRON_SECRET:
+        app.logger.error("CRON_SECRET не задан — служебные эндпоинты закрыты")
+        return jsonify(ok=False, error="CRON_SECRET не задан на сервере"), 503
+    if request.args.get("secret") != CRON_SECRET:
+        return jsonify(ok=False, error="forbidden"), 403
+    return None
+
+
 @app.route("/setwebhook")
 def set_webhook():
-    url = request.url_root.replace("http://", "https://")
-    return jsonify(tg("setWebhook", url=url))
+    denied = _admin_denied()
+    if denied:
+        return denied
+    if not PUBLIC_URL:
+        return jsonify(ok=False, error="PUBLIC_URL или PA_DOMAIN не заданы"), 503
+    return jsonify(tg("setWebhook", url=PUBLIC_URL.rstrip("/") + "/"))
 
 
 @app.route("/deletewebhook")
 def delete_webhook():
+    denied = _admin_denied()
+    if denied:
+        return denied
     return jsonify(tg("deleteWebhook"))
 
 
@@ -1276,11 +1478,17 @@ def github_webhook():
     secret = (os.getenv("GITHUB_SECRET") or os.getenv("GITHUB_WEBHOOK_SECRET") or "").encode("utf-8")
     signature = request.headers.get("X-Hub-Signature-256", "")
 
-    if secret:
-        payload = request.get_data()
-        expected = "sha256=" + hmac.new(secret, payload, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            return "Unauthorized", 401
+    # Без секрета отказываем, а не пропускаем: раньше незаданная переменная
+    # молча отключала проверку подписи, и любой POST запускал git pull с
+    # перезагрузкой приложения. Сломанный деплой заметен сразу, открытый — нет.
+    if not secret:
+        app.logger.error("GITHUB_SECRET не задан — деплой-хук закрыт")
+        return "GITHUB_SECRET не задан на сервере", 503
+
+    payload = request.get_data()
+    expected = "sha256=" + hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return "Unauthorized", 401
 
     repo_dir = os.getenv("DEPLOY_REPO_DIR", "/home/f6iznj3iP7/dietbot")
     try:
@@ -1379,8 +1587,11 @@ def cron_tick():
     Рассылает опросы о приёмах пищи, повторяет один раз через час, вечером
     спрашивает про неучтённые перекусы, раз в неделю предлагает обновить меню.
     """
-    if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
-        return jsonify(ok=False, error="forbidden"), 403
+    # Тоже fail-closed: незаданный секрет открывал бы посторонним рассылку
+    # опросов сразу всем пользователям бота и расход квоты API.
+    denied = _admin_denied()
+    if denied:
+        return denied
 
     now = datetime.now(TZ)
     today = now.date().isoformat()

@@ -4,3 +4,4 @@ python-dotenv
 tzdata
 matplotlib
 sentry-sdk[flask]
+pytest
