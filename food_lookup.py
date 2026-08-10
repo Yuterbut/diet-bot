@@ -8,6 +8,7 @@
 """
 
 import logging
+import re
 
 import requests
 
@@ -24,31 +25,70 @@ HEADERS = {"User-Agent": "AIDietBot/1.0 (Telegram diet planner bot)"}
 TIMEOUT = 12
 
 
+_GRAMS_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(килограмм(?:а|ов)?|кг|kg|грамм(?:а|ов)?|гр?|g)\b",
+    re.IGNORECASE,
+)
+_KG_UNITS = {"кг", "kg", "килограмм", "килограмма", "килограммов"}
+
+# служебные слова, не участвующие в проверке релевантности товара (предлоги/
+# союзы + единицы веса — последние на случай, если не срослись с числом в _GRAMS_RE)
+_STOPWORDS = {
+    "и", "с", "со", "на", "из", "для", "без", "или", "по", "не", "от", "к", "за", "под",
+    "г", "гр", "грамм", "грамма", "граммов", "кг", "килограмм", "килограмма", "килограммов",
+}
+
+
 def _parse_grams(text: str | None) -> float | None:
-    """'42g' / '52,7g' / '100 г' -> граммы. None, если не похоже на граммовку."""
-    if not text or ("g" not in text.lower() and "г" not in text.lower()):
+    """'42g' / '52,7g' / '100 г' / '1 килограмм' -> граммы. None, если в тексте
+    не нашлось похожего на граммовку фрагмента."""
+    if not text:
         return None
-    digits = "".join(c for c in text if c.isdigit() or c in ".,").replace(",", ".")
+    match = _GRAMS_RE.search(text)
+    if not match:
+        return None
     try:
-        value = float(digits)
+        value = float(match.group(1).replace(",", "."))
     except ValueError:
         return None
+    if match.group(2).lower() in _KG_UNITS:
+        value *= 1000
     return value if 1 <= value <= 2000 else None
 
 
-def _from_off_hit(hit: dict) -> dict | None:
+def _significant_words(text: str) -> set[str]:
+    words = re.findall(r"[а-яёa-z]+", _GRAMS_RE.sub(" ", text.lower()))
+    return {w for w in words if len(w) > 2 and w not in _STOPWORDS}
+
+
+def _is_relevant(query: str, product_name: str | None) -> bool:
+    """Без этой проверки полнотекстовый поиск OFF подсовывает случайные
+    совпадения по одному слову — например, на "жареная картошка" находился
+    товар "Сырок Картошка"."""
+    query_words = _significant_words(query)
+    if not query_words:
+        return True
+    name = (product_name or "").lower()
+    matched = sum(1 for w in query_words if w in name)
+    return matched / len(query_words) > 0.5
+
+
+def _from_off_hit(hit: dict, user_grams: float | None = None) -> dict | None:
     n = hit.get("nutriments") or {}
     kcal_100g = n.get("energy-kcal_100g")
     if kcal_100g is None:
         return None
 
     name = hit.get("product_name") or "Продукт"
-    grams = _parse_grams(hit.get("quantity")) or _parse_grams(hit.get("serving_size"))
-    if grams is None or grams > 200:
-        # Либо нет данных о фасовке, либо "quantity" — это вес всей упаковки
-        # (пачка крупы, мешок муки), а не порция за один присест. Берём
-        # стандартную порцию 100 г — концентрация КБЖУ из OFF всё равно точная.
-        grams = 100.0
+    if user_grams is not None:
+        grams = user_grams
+    else:
+        grams = _parse_grams(hit.get("quantity")) or _parse_grams(hit.get("serving_size"))
+        if grams is None or grams > 200:
+            # Либо нет данных о фасовке, либо "quantity" — это вес всей упаковки
+            # (пачка крупы, мешок муки), а не порция за один присест. Берём
+            # стандартную порцию 100 г — концентрация КБЖУ из OFF всё равно точная.
+            grams = 100.0
     scale = grams / 100.0
 
     return {
@@ -76,8 +116,11 @@ def search(query: str) -> dict | None:
         logger.warning("Open Food Facts недоступен: %s", e)
         return None
 
+    user_grams = _parse_grams(query)
     for hit in data.get("hits", []):
-        result = _from_off_hit(hit)
+        if not _is_relevant(query, hit.get("product_name")):
+            continue
+        result = _from_off_hit(hit, user_grams)
         if result:
             return result
     return None

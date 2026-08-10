@@ -894,11 +894,6 @@ def handle_message(msg: dict) -> None:
     text = (msg.get("text") or "").strip()
     low = text.lower()
 
-    if low.startswith("/start"):
-        storage.clear_user(chat_id)
-        tg("sendMessage", chat_id=chat_id, text=WELCOME, reply_markup=goal_keyboard())
-        return
-
     if low.startswith(("/цена", "/price")):
         handle_price_command(chat_id, text)
         return
@@ -911,7 +906,7 @@ def handle_message(msg: dict) -> None:
         ai_advance(chat_id)
         return
 
-    if low.startswith(("/menu", "/меню")):
+    if low.startswith(("/start", "/menu", "/меню")):
         user = storage.save_user(chat_id, {"ai_state": None})
         if user.get("plan_names"):
             tg("sendMessage", chat_id=chat_id, text=plan_text(user, 0),
@@ -959,8 +954,7 @@ def handle_message(msg: dict) -> None:
 
     tg("sendMessage", chat_id=chat_id,
        text="Я работаю кнопками 🙂\n\n"
-            "/start — составить план питания заново\n"
-            "/menu — вернуться в меню (план или начало)\n"
+            "/start, /menu — вернуться в меню (план или начало)\n"
             "/ai — ИИ-диетолог (анкета, дневник КБЖУ, напоминания)\n"
             "/продукты — список продуктов и цен\n"
             "/цена — обновить цену продукта")
