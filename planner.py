@@ -36,14 +36,53 @@ def fits(meal: dict, goal: str, restrictions: set) -> bool:
     return goal == "variety" or goal in meal["goals"]
 
 
-def candidates(meal_type: str, goal: str, restrictions: set) -> list:
+# Насколько человек готов возиться на кухне:
+#   "simple" — только простое и быстрое, "normal" — простое любой длительности,
+#   "any" (или None) — фильтр не применяется.
+COOKING_LEVELS = ("simple", "normal", "any")
+SIMPLE_MAX_TIME = 20
+
+# Специи, масла, соусы и мелочь дома есть почти у всех, их не покупают ради
+# одного блюда. Без этого послабления список разрешённых категорий отсекал бы
+# почти всё меню: соль и масло встречаются в большинстве рецептов.
+PANTRY_CATEGORIES = {"специи", "масла", "соусы", "прочее"}
+
+
+def meal_allowed(meal: dict, cooking_level: str | None,
+                 allowed_categories: set | None) -> bool:
+    """Согласится ли человек это готовить и есть.
+
+    Диетические ограничения сюда намеренно не входят (они в fits): вкусы и
+    навыки можно ослабить ради разнообразия плана, аллергию — нельзя."""
+    if cooking_level in ("simple", "normal") and meal.get("difficulty") != "easy":
+        return False
+    if cooking_level == "simple" and meal.get("time", 0) > SIMPLE_MAX_TIME:
+        return False
+    if allowed_categories is not None:
+        allowed = set(allowed_categories) | PANTRY_CATEGORIES
+        if any(PRODUCTS[key]["category"] not in allowed for key in meal["ingredients"]):
+            return False
+    return True
+
+
+def candidates(meal_type: str, goal: str, restrictions: set,
+               cooking_level: str | None = None,
+               allowed_categories: set | None = None) -> list:
     pool = MEALS[meal_type]
-    strict = [m for m in pool if fits(m, goal, restrictions)]
-    if strict:
-        return strict
-    # если под цель ничего не нашлось — соблюдаем хотя бы ограничения
-    loose = [m for m in pool if all(r in m["tags"] for r in restrictions)]
-    return loose or pool
+
+    def pick(g: str, cooking: str | None, cats: set | None):
+        return [m for m in pool if fits(m, g, restrictions)
+                and meal_allowed(m, cooking, cats)]
+
+    # Уступки идут от вкусов к необходимости: сначала забываем про цель
+    # (goal="variety" в fits и значит «цель не важна»), потом про навык готовки,
+    # потом про список продуктов. Ограничения снимаются последними — набор
+    # продуктов это «не хочу», а ограничения это аллергия и здоровье.
+    return (pick(goal, cooking_level, allowed_categories)
+            or pick("variety", cooking_level, allowed_categories)
+            or pick("variety", None, allowed_categories)
+            or pick("variety", None, None)
+            or pool)
 
 
 def build_shopping_list(plan: list, region: str, overrides: dict | None = None) -> tuple[list, float, float]:
@@ -153,7 +192,9 @@ def _pick(pool: list, counts: dict, last_day: dict, day: int, day_names: list,
 
 
 def _generate_once(goal: str, restrictions: set, meals_per_day: int,
-                   cheap_level: int, region: str, overrides: dict) -> list:
+                   cheap_level: int, region: str, overrides: dict,
+                   cooking_level: str | None = None,
+                   allowed_categories: set | None = None) -> list:
     """
     cheap_level: 0 — свободный подбор, 1 — умеренная экономия, 2 — жёсткая.
     Правила разнообразия действуют на всех уровнях: даже в самом экономном
@@ -170,7 +211,8 @@ def _generate_once(goal: str, restrictions: set, meals_per_day: int,
         day = []
         day_names: list[str] = []
         for meal_type in order:
-            pool = candidates(meal_type, goal, restrictions)
+            pool = candidates(meal_type, goal, restrictions,
+                              cooking_level, allowed_categories)
             meal = _pick(pool, counts[meal_type], last_day[meal_type], day_index,
                          day_names, totals, cheap_level, region, meal_type, overrides)
             name = meal["name"]
@@ -188,7 +230,9 @@ def _generate_once(goal: str, restrictions: set, meals_per_day: int,
 
 
 def generate_plan(goal: str, restrictions: set, meals_per_day: int,
-                  budget: float | None, region: str) -> dict:
+                  budget: float | None, region: str,
+                  cooking_level: str | None = None,
+                  allowed_categories: set | None = None) -> dict:
     """
     Подбирает недельный план. Если задан бюджет, пытается уложиться в него.
     Возвращает словарь с планом, списком покупок и стоимостью.
@@ -206,7 +250,8 @@ def generate_plan(goal: str, restrictions: set, meals_per_day: int,
         else:
             cheap_level = 2
 
-        plan = _generate_once(goal, restrictions, meals_per_day, cheap_level, region, overrides)
+        plan = _generate_once(goal, restrictions, meals_per_day, cheap_level, region,
+                              overrides, cooking_level, allowed_categories)
         items, total, consumed = build_shopping_list(plan, region, overrides)
 
         if best is None or total < best["total"]:
@@ -273,7 +318,9 @@ def rebuild_totals(plan_names: list, region: str) -> tuple[list, int, int]:
 
 
 def swap_options(plan_names: list, day: int, slot: int, meals_per_day: int,
-                 goal: str, restrictions: set, limit: int = 3) -> list:
+                 goal: str, restrictions: set, limit: int = 3,
+                 cooking_level: str | None = None,
+                 allowed_categories: set | None = None) -> list:
     """
     Подбирает альтернативы для конкретного блюда в плане.
     Возвращает список названий: подходят под цель и ограничения,
@@ -288,7 +335,9 @@ def swap_options(plan_names: list, day: int, slot: int, meals_per_day: int,
     # что уже стоит в этом же приёме пищи в другие дни — предлагаем в последнюю очередь
     used_same_slot = {d[slot] for i, d in enumerate(plan_names) if i != day and slot < len(d)}
 
-    pool = [m for m in candidates(meal_type, goal, restrictions) if m["name"] != current]
+    pool = [m for m in candidates(meal_type, goal, restrictions,
+                                  cooking_level, allowed_categories)
+            if m["name"] != current]
     fresh = [m for m in pool if m["name"] not in used_same_slot]
     ranked = fresh + [m for m in pool if m["name"] in used_same_slot]
     return [m["name"] for m in ranked[:limit]]
