@@ -465,7 +465,8 @@ def plan_text(user: dict, day: int = 0) -> str:
         header.append("\n⚠️ В заданный бюджет уложиться не удалось — это самый "
                       "дешёвый возможный вариант.")
     header.append("")
-    header.append(planner.format_day(user["plan_names"], day, user["meals_per_day"]))
+    header.append(planner.format_day(user["plan_names"], day, user["meals_per_day"],
+                                     custom=user.get("custom_meals")))
     header.append("")
     header.append("_👨‍🍳 — есть подробный рецепт_")
     return "\n".join(header)
@@ -502,6 +503,8 @@ def shopping_category_text(user: dict, category: str) -> str:
 
 
 def build_and_save(chat_id: int, user: dict) -> dict:
+    # придумывание блюд занимает несколько секунд — показываем, что бот занят
+    tg("sendChatAction", chat_id=chat_id, action="typing")
     result = planner.generate_plan(
         goal=user["goal"],
         restrictions=set(user.get("restrictions", [])),
@@ -512,11 +515,16 @@ def build_and_save(chat_id: int, user: dict) -> dict:
         # None означает «без фильтра», как и было раньше
         cooking_level=user.get("cooking_level"),
         allowed_categories=user.get("allowed_categories"),
+        ai_fill=True,
     )
     # сохраняем только названия блюд — их достаточно для показа плана
     plan_names = [[m["name"] for m in day] for day in result["plan"]]
     return storage.save_user(chat_id, {
         "plan_names": plan_names,
+        # придуманных блюд нет в статической базе, поэтому храним их рядом с планом.
+        # Каждый пересбор перезаписывает реестр целиком — иначе блюда старых планов
+        # копились бы в хранилище навсегда.
+        "custom_meals": result.get("custom_meals") or {},
         "items": result["items"],
         "total": result["total"],
         "consumed": result.get("consumed"),
@@ -1211,7 +1219,8 @@ def handle_callback(cb: dict) -> None:
             user["plan_names"], day, slot, user["meals_per_day"],
             user["goal"], set(user.get("restrictions", [])),
             cooking_level=user.get("cooking_level"),
-            allowed_categories=user.get("allowed_categories"))
+            allowed_categories=user.get("allowed_categories"),
+            custom=user.get("custom_meals"))
         storage.save_user(chat_id, {"swap_options": options})
         if options:
             current = user["plan_names"][day][slot]
@@ -1227,7 +1236,10 @@ def handle_callback(cb: dict) -> None:
         if choice < len(options):
             plan_names = [list(d) for d in user["plan_names"]]
             plan_names[day][slot] = options[choice]
-            items, total, consumed = planner.rebuild_totals(plan_names, user["region"])
+            items, total, consumed = planner.rebuild_totals(plan_names, user["region"],
+                                                            custom=user.get("custom_meals"))
+            # custom_meals не трогаем: заменённое блюдо могло остаться в другом дне,
+            # а лишняя запись безобидна — реестр перезапишется при пересборе плана
             user = storage.save_user(chat_id, {
                 "plan_names": plan_names, "items": items, "total": total,
                 "consumed": consumed, "bought": [],
@@ -1240,7 +1252,8 @@ def handle_callback(cb: dict) -> None:
     elif action == "RECIPES":
         day = int(parts[1]) if len(parts) > 1 else 0
         plan_names = user.get("plan_names", [])
-        names = planner.recipe_meals_for_day(plan_names, day) if plan_names else []
+        names = (planner.recipe_meals_for_day(plan_names, day, custom=user.get("custom_meals"))
+                 if plan_names else [])
         if names:
             storage.save_user(chat_id, {"recipe_names": names})
             edit(f"👨‍🍳 *Блюда дня {day + 1}, которые нужно готовить*\n\n"
@@ -1255,7 +1268,8 @@ def handle_callback(cb: dict) -> None:
         idx = int(parts[2])
         names = user.get("recipe_names", [])
         if idx < len(names):
-            edit(planner.format_recipe(names[idx]), recipe_back_keyboard(day))
+            edit(planner.format_recipe(names[idx], custom=user.get("custom_meals")),
+                 recipe_back_keyboard(day))
             photo_url = photos.search_dish_photo(names[idx])
             if photo_url:
                 resp = tg("sendPhoto", chat_id=chat_id, photo=photo_url, caption=names[idx])
