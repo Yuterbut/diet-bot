@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import time
 
 import requests
 
@@ -39,10 +40,28 @@ OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 TIMEOUT = 25
 
+# Сколько ждём ИИ там, где человек стоит и смотрит на "печатает…". Провайдеры
+# перебираются по очереди (у GitHub Models вдобавок два адреса), так что без
+# общего дедлайна недоступный ИИ складывается в полторы минуты — Telegram за
+# это время повторяет вебхук, и пользователь получает второй план.
+INTERACTIVE_DEADLINE = 12
 
-def _post(url: str, headers: dict, payload: dict) -> dict | None:
+
+def _request_timeout(end: float | None) -> float:
+    """Сколько осталось от общего бюджета, но не больше обычного таймаута."""
+    if end is None:
+        return TIMEOUT
+    return max(1.0, min(TIMEOUT, end - time.monotonic()))
+
+
+def _out_of_time(end: float | None) -> bool:
+    return end is not None and time.monotonic() >= end
+
+
+def _post(url: str, headers: dict, payload: dict, end: float | None = None) -> dict | None:
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
+        resp = requests.post(url, headers=headers, json=payload,
+                             timeout=_request_timeout(end))
     except requests.RequestException as e:
         logger.warning("AI request error (%s): %s", url, e)
         return None
@@ -64,7 +83,8 @@ def _extract_text(data: dict | None) -> str | None:
         return None
 
 
-def _github_models_chat(messages: list, temperature: float, max_tokens: int) -> str | None:
+def _github_models_chat(messages: list, temperature: float, max_tokens: int,
+                        end: float | None = None) -> str | None:
     token = os.getenv("GITHUB_MODELS_TOKEN")
     if not token:
         return None
@@ -72,44 +92,58 @@ def _github_models_chat(messages: list, temperature: float, max_tokens: int) -> 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
 
-    text = _extract_text(_post(GITHUB_MODELS_URL, headers, payload))
+    text = _extract_text(_post(GITHUB_MODELS_URL, headers, payload, end))
     if text is not None:
         return text
+
+    if _out_of_time(end):
+        return None
 
     # старый эндпоинт GitHub Models — модель там без префикса издателя
     legacy_model = model.split("/", 1)[-1]
     legacy_payload = {**payload, "model": legacy_model}
-    return _extract_text(_post(GITHUB_MODELS_URL_LEGACY, headers, legacy_payload))
+    return _extract_text(_post(GITHUB_MODELS_URL_LEGACY, headers, legacy_payload, end))
 
 
-def _groq_chat(messages: list, temperature: float, max_tokens: int) -> str | None:
+def _groq_chat(messages: list, temperature: float, max_tokens: int,
+               end: float | None = None) -> str | None:
     key = os.getenv("GROQ_API_KEY")
     if not key:
         return None
     model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    return _extract_text(_post(GROQ_URL, headers, payload))
+    return _extract_text(_post(GROQ_URL, headers, payload, end))
 
 
-def _openai_chat(messages: list, temperature: float, max_tokens: int) -> str | None:
+def _openai_chat(messages: list, temperature: float, max_tokens: int,
+                 end: float | None = None) -> str | None:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         return None
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    return _extract_text(_post(OPENAI_URL, headers, payload))
+    return _extract_text(_post(OPENAI_URL, headers, payload, end))
 
 
-def chat(messages: list, temperature: float = 0.4, max_tokens: int = 700) -> str | None:
+def chat(messages: list, temperature: float = 0.4, max_tokens: int = 700,
+         deadline: float | None = None) -> str | None:
     """Единая точка входа: GitHub Models -> Groq -> OpenAI -> None.
 
     GitHub Models по состоянию на сейчас периодически недоступен (retirement
     brownout / 410), поэтому Groq — фактически основной бесплатный провайдер,
-    если задан GROQ_API_KEY."""
+    если задан GROQ_API_KEY.
+
+    deadline — общий бюджет в секундах на весь перебор провайдеров. Нужен там,
+    где ответа ждёт живой человек: без него недоступный ИИ складывает таймауты
+    всех адресов подряд."""
+    end = None if deadline is None else time.monotonic() + deadline
     for provider in (_github_models_chat, _groq_chat, _openai_chat):
-        text = provider(messages, temperature, max_tokens)
+        if _out_of_time(end):
+            logger.warning("Бюджет ожидания ИИ исчерпан, остальных провайдеров не спрашиваем")
+            break
+        text = provider(messages, temperature, max_tokens, end)
         if text is not None:
             return text.strip()
     logger.error("AI недоступен: GitHub Models, Groq и OpenAI не ответили")
@@ -537,7 +571,9 @@ def generate_meal(meal_type: str, allowed_product_keys: list[str],
         {"role": "system", "content": MEAL_GENERATE_SYSTEM},
         {"role": "user", "content": _meal_request_text(meal_type, keys, cooking_level, goal)},
     ]
-    text = chat(messages, temperature=0.7, max_tokens=600)
+    # Блюда генерируются во время сборки плана, пока человек ждёт ответа в чате,
+    # и таких вызовов может быть несколько подряд — поэтому с дедлайном.
+    text = chat(messages, temperature=0.7, max_tokens=600, deadline=INTERACTIVE_DEADLINE)
     if text is None:
         return None
 

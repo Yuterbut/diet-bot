@@ -91,6 +91,13 @@ FEW_DISHES = 7  # блюд на приём пищи меньше, чем дне�
 TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 
+# Публичный адрес бота. Берём из настроек, а НЕ из request.url_root: тот
+# строится по заголовку Host, который присылает клиент. Запрос с подставленным
+# Host переставил бы вебхук Telegram на чужой сервер — туда ушли бы сообщения
+# всех пользователей. PA_DOMAIN уже задан для перезагрузки веб-аппа.
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or
+              (f"https://{os.getenv('PA_DOMAIN')}" if os.getenv("PA_DOMAIN") else ""))
+
 SEX_LABELS = {"m": "Мужской", "f": "Женский"}
 MEAL_SLOT_LABELS = {"breakfast": "🌅 Завтрак", "lunch": "🥗 Обед", "dinner": "🍽 Ужин", "snack": "🍎 Перекус"}
 DEFAULT_REMINDERS = {"breakfast": "08:30", "lunch": "13:30", "dinner": "19:30"}
@@ -1411,14 +1418,35 @@ def index():
     return jsonify(ok=True)
 
 
+def _admin_denied():
+    """Проверка секрета для служебных эндпоинтов. Отдельную переменную заводить
+    не стали: чем их больше, тем выше шанс забыть задать одну из них — а незаданный
+    секрет здесь означает, что любой желающий может выключить бота.
+
+    Возвращает готовый ответ при отказе либо None, если доступ разрешён."""
+    if not CRON_SECRET:
+        app.logger.error("CRON_SECRET не задан — служебные эндпоинты закрыты")
+        return jsonify(ok=False, error="CRON_SECRET не задан на сервере"), 503
+    if request.args.get("secret") != CRON_SECRET:
+        return jsonify(ok=False, error="forbidden"), 403
+    return None
+
+
 @app.route("/setwebhook")
 def set_webhook():
-    url = request.url_root.replace("http://", "https://")
-    return jsonify(tg("setWebhook", url=url))
+    denied = _admin_denied()
+    if denied:
+        return denied
+    if not PUBLIC_URL:
+        return jsonify(ok=False, error="PUBLIC_URL или PA_DOMAIN не заданы"), 503
+    return jsonify(tg("setWebhook", url=PUBLIC_URL.rstrip("/") + "/"))
 
 
 @app.route("/deletewebhook")
 def delete_webhook():
+    denied = _admin_denied()
+    if denied:
+        return denied
     return jsonify(tg("deleteWebhook"))
 
 
@@ -1450,11 +1478,17 @@ def github_webhook():
     secret = (os.getenv("GITHUB_SECRET") or os.getenv("GITHUB_WEBHOOK_SECRET") or "").encode("utf-8")
     signature = request.headers.get("X-Hub-Signature-256", "")
 
-    if secret:
-        payload = request.get_data()
-        expected = "sha256=" + hmac.new(secret, payload, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            return "Unauthorized", 401
+    # Без секрета отказываем, а не пропускаем: раньше незаданная переменная
+    # молча отключала проверку подписи, и любой POST запускал git pull с
+    # перезагрузкой приложения. Сломанный деплой заметен сразу, открытый — нет.
+    if not secret:
+        app.logger.error("GITHUB_SECRET не задан — деплой-хук закрыт")
+        return "GITHUB_SECRET не задан на сервере", 503
+
+    payload = request.get_data()
+    expected = "sha256=" + hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return "Unauthorized", 401
 
     repo_dir = os.getenv("DEPLOY_REPO_DIR", "/home/f6iznj3iP7/dietbot")
     try:
@@ -1553,8 +1587,11 @@ def cron_tick():
     Рассылает опросы о приёмах пищи, повторяет один раз через час, вечером
     спрашивает про неучтённые перекусы, раз в неделю предлагает обновить меню.
     """
-    if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
-        return jsonify(ok=False, error="forbidden"), 403
+    # Тоже fail-closed: незаданный секрет открывал бы посторонним рассылку
+    # опросов сразу всем пользователям бота и расход квоты API.
+    denied = _admin_denied()
+    if denied:
+        return denied
 
     now = datetime.now(TZ)
     today = now.date().isoformat()
